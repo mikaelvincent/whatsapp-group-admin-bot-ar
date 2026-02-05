@@ -90,9 +90,58 @@ function parseCommand(text, prefix) {
   return { name, args, rawArgs };
 }
 
+function parseDurationToken(value) {
+  const v = String(value ?? '')
+    .trim()
+    .toLowerCase();
+
+  if (!v) return null;
+
+  const match = v.match(/^(\d{1,6})([smhdw])$/);
+  if (!match) return null;
+
+  const count = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(count) || count <= 0) return null;
+
+  const unit = match[2];
+
+  const mult =
+    unit === 's'
+      ? 1000
+      : unit === 'm'
+      ? 60_000
+      : unit === 'h'
+      ? 3_600_000
+      : unit === 'd'
+      ? 86_400_000
+      : 604_800_000;
+
+  const ms = count * mult;
+  const maxMs = 365 * 24 * 60 * 60 * 1000;
+
+  if (ms > maxMs) return { count, unit, ms, tooLarge: true };
+  return { count, unit, ms, tooLarge: false };
+}
+
+function renderDurationAr(duration) {
+  if (!duration) return '';
+  const label =
+    duration.unit === 's'
+      ? 'ثانية'
+      : duration.unit === 'm'
+      ? 'دقيقة'
+      : duration.unit === 'h'
+      ? 'ساعة'
+      : duration.unit === 'd'
+      ? 'يوم'
+      : 'أسبوع';
+  return `${duration.count} ${label}`;
+}
+
 function normalizePhoneTarget(value) {
   const digits = String(value ?? '').replace(/\D/g, '');
   if (!digits) return null;
+  if (digits.length < 6 || digits.length > 20) return null;
   return normalizeUserJid(`${digits}@s.whatsapp.net`);
 }
 
@@ -338,6 +387,59 @@ export function createCommandRouter({ config, logger, store }) {
     return true;
   };
 
+  const maybeEnforceMuteMessage = async ({ socket, msg, groupJid, senderJid, botJid }) => {
+    if (!groupJid || !senderJid) return false;
+
+    const state = store.getMute(groupJid, senderJid);
+    if (!state?.muted) return false;
+
+    let deleted = false;
+
+    if (msg?.key) {
+      let canDelete = true;
+
+      if (botJid) {
+        const botCheck = await getAdminStatus(socket, groupJid, botJid);
+        if (botCheck.ok && !botCheck.isAdmin) canDelete = false;
+      }
+
+      if (canDelete) {
+        try {
+          await socket.sendMessage(groupJid, { delete: msg.key });
+          deleted = true;
+        } catch (err) {
+          logger.warn('فشل حذف رسالة مكتوم', {
+            group: groupJid,
+            from: senderJid,
+            err: String(err)
+          });
+        }
+      }
+    }
+
+    logger.info('تنفيذ كتم', {
+      group: groupJid,
+      from: senderJid,
+      deleted,
+      until_ms: state.until
+    });
+
+    if (!shouldSendWarning(groupJid, senderJid, 'mute')) return true;
+
+    const tag = jidMentionTag(senderJid);
+    const mentions = tag ? [senderJid] : [];
+
+    const warningText = `⚠️ ${tag} أنت مكتوم في هذه المجموعة.`;
+
+    try {
+      await safeSendText(socket, groupJid, warningText, null, { mentions });
+    } catch (err) {
+      logger.warn('فشل إرسال تحذير كتم', { group: groupJid, from: senderJid, err: String(err) });
+    }
+
+    return true;
+  };
+
   const maybeModerateMessage = async ({ socket, msg, groupJid, senderJid, isAllowlisted, botJid }) => {
     if (!groupJid || !senderJid) return;
 
@@ -370,7 +472,11 @@ export function createCommandRouter({ config, logger, store }) {
       rule = 'antiimage';
     } else if (moderation.antiSticker && media.hasSticker) {
       rule = 'antisticker';
-    } else if (moderation.filterEnabled && Array.isArray(moderation.bannedWords) && moderation.bannedWords.length > 0) {
+    } else if (
+      moderation.filterEnabled &&
+      Array.isArray(moderation.bannedWords) &&
+      moderation.bannedWords.length > 0
+    ) {
       const found = findBannedWord(text, moderation.bannedWords);
       if (found) {
         rule = 'filter';
@@ -450,7 +556,11 @@ export function createCommandRouter({ config, logger, store }) {
     lines.push('📜 القواعد الحالية');
     lines.push('');
     lines.push(`- منع الروابط: ${onOff(m.antiLink)}`);
-    lines.push(`- فلتر الكلمات: ${onOff(m.filterEnabled)}${m.filterEnabled ? ` (عدد العناصر: ${m.bannedWords.length})` : ''}`);
+    lines.push(
+      `- فلتر الكلمات: ${onOff(m.filterEnabled)}${
+        m.filterEnabled ? ` (عدد العناصر: ${m.bannedWords.length})` : ''
+      }`
+    );
     lines.push(`- منع الصور: ${onOff(m.antiImage)}`);
     lines.push(`- منع الملصقات: ${onOff(m.antiSticker)}`);
     lines.push('');
@@ -881,6 +991,104 @@ export function createCommandRouter({ config, logger, store }) {
       }
     },
     {
+      name: 'mute',
+      aliases: [],
+      category: 'admin',
+      privileged: true,
+      groupOnly: true,
+      handler: async (ctx) => {
+        const targets = sanitizeTargets(ctx.socket, ctx.targetJids);
+
+        if (targets.length === 0) {
+          await ctx.reply(
+            `لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}mute @شخص 10m`
+          );
+          return;
+        }
+
+        let duration = null;
+        for (const a of Array.isArray(ctx.args) ? ctx.args : []) {
+          const parsed = parseDurationToken(a);
+          if (!parsed) continue;
+
+          if (parsed.tooLarge) {
+            await ctx.reply('المدة كبيرة جدًا. الحد الأقصى هو 365 يوم. مثال: !mute @شخص 10m');
+            return;
+          }
+
+          duration = parsed;
+          break;
+        }
+
+        const untilMs = duration ? Date.now() + duration.ms : null;
+
+        let res;
+        try {
+          res = await ctx.store.addMutes(ctx.groupJid, targets, untilMs);
+        } catch (err) {
+          logger.warn('فشل تحديث قائمة الكتم', { group: ctx.groupJid, err: String(err) });
+          await ctx.reply('حدث خطأ أثناء تحديث قائمة الكتم.');
+          return;
+        }
+
+        const lines = [];
+
+        if (duration) {
+          lines.push(`✅ تم كتم ${targets.length} عضو/أعضاء لمدة ${renderDurationAr(duration)}.`);
+        } else {
+          lines.push(`✅ تم كتم ${targets.length} عضو/أعضاء بدون مدة.`);
+        }
+
+        if (res && res.added === 0 && res.updated === 0) {
+          lines.push('ℹ️ الأهداف مكتومون بالفعل.');
+        }
+
+        if (ctx.botJid) {
+          const check = await getAdminStatus(ctx.socket, ctx.groupJid, ctx.botJid);
+          if (!check.ok) {
+            lines.push('⚠️ ملاحظة: تعذر التحقق من صلاحيات البوت لحذف رسائل المكتومين.');
+          } else if (!check.isAdmin) {
+            lines.push('⚠️ ملاحظة: البوت ليس مشرفًا وقد لا يستطيع حذف رسائل المكتومين.');
+          }
+        }
+
+        await ctx.reply(lines.join('\n'));
+      }
+    },
+    {
+      name: 'unmute',
+      aliases: [],
+      category: 'admin',
+      privileged: true,
+      groupOnly: true,
+      handler: async (ctx) => {
+        const targets = sanitizeTargets(ctx.socket, ctx.targetJids);
+
+        if (targets.length === 0) {
+          await ctx.reply(
+            `لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}unmute @شخص`
+          );
+          return;
+        }
+
+        let res;
+        try {
+          res = await ctx.store.removeMutes(ctx.groupJid, targets);
+        } catch (err) {
+          logger.warn('فشل تحديث قائمة فك الكتم', { group: ctx.groupJid, err: String(err) });
+          await ctx.reply('حدث خطأ أثناء تحديث قائمة الكتم.');
+          return;
+        }
+
+        if (!res || res.removed === 0) {
+          await ctx.reply('لا يوجد كتم على الأهداف المحددة.');
+          return;
+        }
+
+        await ctx.reply(`✅ تم فك الكتم عن ${res.removed} عضو/أعضاء.`);
+      }
+    },
+    {
       name: 'promote',
       aliases: [],
       category: 'admin',
@@ -1031,6 +1239,22 @@ export function createCommandRouter({ config, logger, store }) {
 
     const isAllowlisted = Boolean(senderJid && allowlist.has(senderJid));
     const botJid = getBotJid(socket);
+
+    if (isGroup && senderJid) {
+      try {
+        const enforced = await maybeEnforceMuteMessage({
+          socket,
+          msg,
+          groupJid: chatJid,
+          senderJid,
+          botJid
+        });
+
+        if (enforced) return;
+      } catch (err) {
+        logger.warn('فشل تنفيذ كتم', { group: chatJid, from: senderJid, err: String(err) });
+      }
+    }
 
     if (isGroup && senderJid) {
       try {
