@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-const STORE_VERSION = 1;
+const STORE_VERSION = 2;
 
 function isGroupJid(jid) {
   return typeof jid === 'string' && jid.endsWith('@g.us');
@@ -23,8 +23,30 @@ function normalizeUserJid(jid) {
   return `${user}@${serverPart}`;
 }
 
+function normalizeBannedWord(value) {
+  const v = String(value ?? '').trim();
+  if (!v) return null;
+  return v.replace(/\s+/g, ' ');
+}
+
 function uniq(list) {
   return Array.from(new Set(list));
+}
+
+function uniqBannedWords(list) {
+  const out = [];
+  const seen = new Set();
+
+  for (const raw of Array.isArray(list) ? list : []) {
+    const v = normalizeBannedWord(raw);
+    if (!v) continue;
+    const key = v.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(v);
+  }
+
+  return out;
 }
 
 async function ensureSecureDir(dirPath) {
@@ -60,12 +82,33 @@ function normalizeStoreData(value) {
   return { version: STORE_VERSION, groups };
 }
 
+function ensureModerationConfig(g) {
+  if (!g.moderation || typeof g.moderation !== 'object') g.moderation = {};
+  const m = g.moderation;
+
+  if (typeof m.antiLink !== 'boolean') m.antiLink = false;
+  if (typeof m.filterEnabled !== 'boolean') m.filterEnabled = false;
+  if (typeof m.antiImage !== 'boolean') m.antiImage = false;
+  if (typeof m.antiSticker !== 'boolean') m.antiSticker = false;
+  if (typeof m.exemptAllowlisted !== 'boolean') m.exemptAllowlisted = true;
+  if (typeof m.exemptAdmins !== 'boolean') m.exemptAdmins = true;
+
+  return m;
+}
+
 function ensureGroup(data, groupJid) {
   if (!isGroupJid(groupJid)) return null;
   if (!data.groups[groupJid] || typeof data.groups[groupJid] !== 'object') data.groups[groupJid] = {};
   const g = data.groups[groupJid];
+
   if (!Array.isArray(g.bans)) g.bans = [];
   g.bans = uniq(g.bans.map(normalizeUserJid).filter(Boolean));
+
+  ensureModerationConfig(g);
+
+  if (!Array.isArray(g.bannedWords)) g.bannedWords = [];
+  g.bannedWords = uniqBannedWords(g.bannedWords);
+
   return g;
 }
 
@@ -119,7 +162,9 @@ export async function createStore({ filePath, logger } = {}) {
       if (!g) return { added: 0, total: 0 };
 
       const before = new Set(g.bans);
-      const incoming = uniq((Array.isArray(userJids) ? userJids : []).map(normalizeUserJid).filter(Boolean));
+      const incoming = uniq(
+        (Array.isArray(userJids) ? userJids : []).map(normalizeUserJid).filter(Boolean)
+      );
 
       let added = 0;
       for (const jid of incoming) {
@@ -139,7 +184,9 @@ export async function createStore({ filePath, logger } = {}) {
       if (!g) return { removed: 0, total: 0 };
 
       const before = new Set(g.bans);
-      const incoming = uniq((Array.isArray(userJids) ? userJids : []).map(normalizeUserJid).filter(Boolean));
+      const incoming = uniq(
+        (Array.isArray(userJids) ? userJids : []).map(normalizeUserJid).filter(Boolean)
+      );
 
       let removed = 0;
       for (const jid of incoming) {
@@ -151,12 +198,114 @@ export async function createStore({ filePath, logger } = {}) {
       return { removed, total: g.bans.length };
     });
 
+  const getModeration = (groupJid) => {
+    const g = ensureGroup(data, groupJid);
+    if (!g) return null;
+
+    const m = ensureModerationConfig(g);
+    return {
+      antiLink: Boolean(m.antiLink),
+      filterEnabled: Boolean(m.filterEnabled),
+      antiImage: Boolean(m.antiImage),
+      antiSticker: Boolean(m.antiSticker),
+      exemptAllowlisted: Boolean(m.exemptAllowlisted),
+      exemptAdmins: Boolean(m.exemptAdmins),
+      bannedWords: [...(Array.isArray(g.bannedWords) ? g.bannedWords : [])]
+    };
+  };
+
+  const setModerationFlag = (groupJid, key, value) =>
+    enqueue(async () => {
+      const g = ensureGroup(data, groupJid);
+      if (!g) return { ok: false, value: false };
+      const m = ensureModerationConfig(g);
+
+      const known = new Set([
+        'antiLink',
+        'filterEnabled',
+        'antiImage',
+        'antiSticker',
+        'exemptAllowlisted',
+        'exemptAdmins'
+      ]);
+
+      if (!known.has(key)) return { ok: false, value: false };
+
+      m[key] = Boolean(value);
+      await flush();
+      return { ok: true, value: Boolean(m[key]) };
+    });
+
+  const setAntiLink = (groupJid, enabled) => setModerationFlag(groupJid, 'antiLink', enabled);
+  const setFilterEnabled = (groupJid, enabled) =>
+    setModerationFlag(groupJid, 'filterEnabled', enabled);
+  const setAntiImage = (groupJid, enabled) => setModerationFlag(groupJid, 'antiImage', enabled);
+  const setAntiSticker = (groupJid, enabled) =>
+    setModerationFlag(groupJid, 'antiSticker', enabled);
+  const setExemptAllowlisted = (groupJid, enabled) =>
+    setModerationFlag(groupJid, 'exemptAllowlisted', enabled);
+  const setExemptAdmins = (groupJid, enabled) =>
+    setModerationFlag(groupJid, 'exemptAdmins', enabled);
+
+  const listBannedWords = (groupJid) => {
+    const g = ensureGroup(data, groupJid);
+    return g ? [...g.bannedWords] : [];
+  };
+
+  const addBannedWord = (groupJid, phrase) =>
+    enqueue(async () => {
+      const g = ensureGroup(data, groupJid);
+      if (!g) return { added: 0, total: 0 };
+
+      const v = normalizeBannedWord(phrase);
+      if (!v) return { added: 0, total: g.bannedWords.length };
+
+      const needle = v.toLowerCase();
+      const existing = new Set(g.bannedWords.map((w) => String(w).toLowerCase()));
+
+      if (existing.has(needle)) return { added: 0, total: g.bannedWords.length };
+
+      g.bannedWords.push(v);
+      g.bannedWords = uniqBannedWords(g.bannedWords);
+      await flush();
+      return { added: 1, total: g.bannedWords.length };
+    });
+
+  const removeBannedWord = (groupJid, phrase) =>
+    enqueue(async () => {
+      const g = ensureGroup(data, groupJid);
+      if (!g) return { removed: 0, total: 0 };
+
+      const v = normalizeBannedWord(phrase);
+      if (!v) return { removed: 0, total: g.bannedWords.length };
+
+      const needle = v.toLowerCase();
+      const before = Array.isArray(g.bannedWords) ? g.bannedWords : [];
+      const after = before.filter((w) => String(w).toLowerCase() !== needle);
+
+      const removed = before.length - after.length;
+      g.bannedWords = uniqBannedWords(after);
+      await flush();
+
+      return { removed, total: g.bannedWords.length };
+    });
+
   return {
     path: resolvedPath,
     listBans,
     isBanned,
     addBans,
     removeBans,
+    getModeration,
+    setAntiLink,
+    setFilterEnabled,
+    setAntiImage,
+    setAntiSticker,
+    setExemptAllowlisted,
+    setExemptAdmins,
+    listBannedWords,
+    addBannedWord,
+    removeBannedWord,
     close: async () => {
       await opChain;
     }
