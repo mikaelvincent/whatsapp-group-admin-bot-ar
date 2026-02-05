@@ -1,0 +1,441 @@
+function isGroupJid(jid) {
+  return typeof jid === 'string' && jid.endsWith('@g.us');
+}
+
+function isUserJid(jid) {
+  return typeof jid === 'string' && jid.endsWith('@s.whatsapp.net');
+}
+
+function normalizeUserJid(jid) {
+  if (typeof jid !== 'string') return null;
+  const trimmed = jid.trim();
+  if (!trimmed) return null;
+
+  const at = trimmed.indexOf('@');
+  if (at === -1) return null;
+
+  const userPart = trimmed.slice(0, at);
+  const serverPart = trimmed.slice(at + 1).toLowerCase();
+  const user = userPart.split(':')[0];
+
+  if (!user || !serverPart) return null;
+  return `${user}@${serverPart}`;
+}
+
+function unwrapMessage(message) {
+  if (!message || typeof message !== 'object') return null;
+  if (message.ephemeralMessage?.message) return unwrapMessage(message.ephemeralMessage.message);
+  if (message.viewOnceMessage?.message) return unwrapMessage(message.viewOnceMessage.message);
+  if (message.viewOnceMessageV2?.message) return unwrapMessage(message.viewOnceMessageV2.message);
+  if (message.viewOnceMessageV2Extension?.message)
+    return unwrapMessage(message.viewOnceMessageV2Extension.message);
+  return message;
+}
+
+function extractText(message) {
+  const msg = unwrapMessage(message);
+  if (!msg) return null;
+
+  return (
+    msg.conversation ||
+    msg.extendedTextMessage?.text ||
+    msg.imageMessage?.caption ||
+    msg.videoMessage?.caption ||
+    msg.documentMessage?.caption ||
+    null
+  );
+}
+
+function extractContextInfo(message) {
+  const msg = unwrapMessage(message);
+  if (!msg) return null;
+
+  return (
+    msg.extendedTextMessage?.contextInfo ||
+    msg.imageMessage?.contextInfo ||
+    msg.videoMessage?.contextInfo ||
+    msg.documentMessage?.contextInfo ||
+    null
+  );
+}
+
+function extractMentions(message) {
+  const ctx = extractContextInfo(message);
+  const raw = ctx?.mentionedJid;
+  if (!Array.isArray(raw)) return [];
+  return raw.map(normalizeUserJid).filter(Boolean);
+}
+
+function extractQuotedParticipant(message) {
+  const ctx = extractContextInfo(message);
+  return normalizeUserJid(ctx?.participant || null);
+}
+
+function parseCommand(text, prefix) {
+  const trimmed = String(text ?? '').trim();
+  if (!trimmed) return null;
+
+  if (!trimmed.startsWith(prefix)) return null;
+
+  const withoutPrefix = trimmed.slice(prefix.length).trim();
+  if (!withoutPrefix) return null;
+
+  const parts = withoutPrefix.split(/\s+/);
+  const name = String(parts[0] ?? '').toLowerCase();
+  if (!name) return null;
+
+  const args = parts.slice(1);
+  const rawArgs = args.join(' ');
+
+  return { name, args, rawArgs };
+}
+
+function normalizePhoneTarget(value) {
+  const digits = String(value ?? '').replace(/\D/g, '');
+  if (!digits) return null;
+  return normalizeUserJid(`${digits}@s.whatsapp.net`);
+}
+
+function resolveTargetsFromMessage(message, args) {
+  const mentionTargets = extractMentions(message);
+  if (mentionTargets.length > 0) {
+    return { targets: Array.from(new Set(mentionTargets)), source: 'mentions' };
+  }
+
+  const quoted = extractQuotedParticipant(message);
+  if (quoted) {
+    return { targets: [quoted], source: 'reply' };
+  }
+
+  for (const a of Array.isArray(args) ? args : []) {
+    const jid = normalizePhoneTarget(a);
+    if (jid) return { targets: [jid], source: 'number' };
+  }
+
+  return { targets: [], source: null };
+}
+
+function renderHelp({ prefix, commands }) {
+  const categories = {
+    admin: 'إدارة',
+    moderation: 'إشراف',
+    fun: 'فعاليات'
+  };
+
+  const byCat = new Map(Object.keys(categories).map((k) => [k, []]));
+
+  for (const cmd of commands) {
+    const cat = categories[cmd.category] ? cmd.category : 'fun';
+    byCat.get(cat).push(cmd);
+  }
+
+  const lines = [];
+  lines.push('📋 قائمة الأوامر');
+  lines.push('');
+  lines.push('🛡️ ملاحظة: الأوامر المحمية تعمل للمخولين فقط.');
+
+  for (const [catKey, label] of Object.entries(categories)) {
+    const list = byCat.get(catKey) || [];
+    if (list.length === 0) continue;
+
+    lines.push('');
+    lines.push(`• ${label}`);
+
+    for (const cmd of list) {
+      const names = [cmd.name, ...(cmd.aliases || [])]
+        .map((n) => `${prefix}${n}`)
+        .join(' / ');
+      const suffix = cmd.privileged ? ' (محمي)' : '';
+      lines.push(`- ${names}${suffix}`);
+    }
+  }
+
+  lines.push('');
+  lines.push(`اكتب ${prefix}targets لمعرفة طريقة تحديد الهدف.`);
+
+  return lines.join('\n');
+}
+
+async function safeSendText(socket, jid, text, quoted) {
+  if (!jid) return;
+  await socket.sendMessage(jid, { text: String(text ?? '') }, quoted ? { quoted } : undefined);
+}
+
+export function createCommandRouter({ config, logger }) {
+  const allowlist = new Set(
+    (Array.isArray(config.allowlist) ? config.allowlist : [])
+      .map(normalizeUserJid)
+      .filter(Boolean)
+  );
+
+  const groupMetaCache = new Map();
+  const groupMetaTtlMs = 30_000;
+
+  const getGroupMetadata = async (socket, groupJid) => {
+    const now = Date.now();
+    const cached = groupMetaCache.get(groupJid);
+
+    if (cached && now - cached.ts < groupMetaTtlMs) return cached.data;
+
+    const data = await socket.groupMetadata(groupJid);
+    groupMetaCache.set(groupJid, { ts: now, data });
+    return data;
+  };
+
+  const isCallerGroupAdmin = async (socket, groupJid, callerJid) => {
+    if (!groupJid || !callerJid) return false;
+
+    try {
+      const meta = await getGroupMetadata(socket, groupJid);
+      const parts = meta?.participants;
+      if (!Array.isArray(parts)) return false;
+
+      const normalizedCaller = normalizeUserJid(callerJid);
+
+      return parts.some((p) => {
+        const pid = normalizeUserJid(p?.id || p?.jid || p?.participant || null);
+        if (!pid) return false;
+        if (pid !== normalizedCaller) return false;
+        return Boolean(p?.admin);
+      });
+    } catch (err) {
+      logger.warn('فشل التحقق من مشرفي المجموعة', { err: String(err) });
+      return false;
+    }
+  };
+
+  const commands = [
+    {
+      name: 'help',
+      aliases: ['menu'],
+      category: 'fun',
+      privileged: false,
+      groupOnly: true,
+      handler: async (ctx) => {
+        await ctx.reply(
+          renderHelp({
+            prefix: ctx.prefix,
+            commands
+          })
+        );
+      }
+    },
+    {
+      name: 'ping',
+      aliases: ['p'],
+      category: 'fun',
+      privileged: false,
+      groupOnly: true,
+      handler: async (ctx) => {
+        await ctx.reply(String(config.pingResponse ?? '🏓 بونج!'));
+      }
+    },
+    {
+      name: 'auth',
+      aliases: ['whoami'],
+      category: 'fun',
+      privileged: false,
+      groupOnly: true,
+      handler: async (ctx) => {
+        if (allowlist.size === 0) {
+          await ctx.reply('⚠️ لم يتم إعداد قائمة السماح للمخولين بعد.');
+          return;
+        }
+
+        if (ctx.isAllowlisted) {
+          await ctx.reply('✅ أنت ضمن قائمة السماح.');
+          return;
+        }
+
+        await ctx.reply('❌ لست ضمن قائمة السماح.');
+      }
+    },
+    {
+      name: 'secure',
+      aliases: ['adminonly'],
+      category: 'admin',
+      privileged: true,
+      groupOnly: true,
+      handler: async (ctx) => {
+        await ctx.reply('✅ تم تنفيذ الأمر المحمي بنجاح.');
+      }
+    },
+    {
+      name: 'targets',
+      aliases: ['target'],
+      category: 'fun',
+      privileged: false,
+      groupOnly: true,
+      handler: async (ctx) => {
+        const label =
+          ctx.targetSource === 'mentions'
+            ? 'بالإشارة'
+            : ctx.targetSource === 'reply'
+            ? 'بالرد'
+            : ctx.targetSource === 'number'
+            ? 'بالرقم'
+            : 'غير محدد';
+
+        if (ctx.targetJids.length === 0) {
+          await ctx.reply(
+            `لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}targets @شخص`
+          );
+          return;
+        }
+
+        await ctx.reply(`تم تحديد ${ctx.targetJids.length} هدف (${label}).`);
+      }
+    }
+  ];
+
+  const commandIndex = new Map();
+  for (const cmd of commands) {
+    commandIndex.set(cmd.name.toLowerCase(), cmd);
+    for (const a of cmd.aliases || []) {
+      commandIndex.set(String(a).toLowerCase(), cmd);
+    }
+  }
+
+  const replyUnknownCommand = async (socket, jid, quoted) => {
+    await safeSendText(socket, jid, `أمر غير معروف. اكتب ${config.prefix}help لعرض الأوامر.`, quoted);
+  };
+
+  const replyGroupOnly = async (socket, jid, quoted) => {
+    await safeSendText(socket, jid, 'هذا الأمر يعمل داخل المجموعات فقط.', quoted);
+  };
+
+  const replyNotAllowlisted = async (socket, jid, quoted) => {
+    if (allowlist.size === 0) {
+      await safeSendText(socket, jid, '⚠️ لم يتم إعداد قائمة السماح للمخولين بعد.', quoted);
+      return;
+    }
+
+    await safeSendText(socket, jid, 'عذرًا، هذا الأمر مخصص للمخولين فقط.', quoted);
+  };
+
+  const replyNotGroupAdmin = async (socket, jid, quoted) => {
+    await safeSendText(socket, jid, 'عذرًا، هذا الأمر متاح لمشرفي المجموعة فقط.', quoted);
+  };
+
+  const handle = async ({ socket, msg }) => {
+    if (!msg?.message) return;
+    if (msg.key?.fromMe) return;
+
+    const chatJid = msg.key?.remoteJid;
+    if (!chatJid || chatJid === 'status@broadcast') return;
+    if (!isGroupJid(chatJid) && !isUserJid(chatJid)) return;
+
+    const text = extractText(msg.message);
+    if (!text) return;
+
+    const parsed = parseCommand(text, config.prefix);
+    if (!parsed) return;
+
+    const def = commandIndex.get(parsed.name);
+
+    const isGroup = isGroupJid(chatJid);
+    const senderRawJid = isGroup ? msg.key?.participant : msg.key?.remoteJid;
+    const senderJid = normalizeUserJid(senderRawJid);
+
+    const isAllowlisted = Boolean(senderJid && allowlist.has(senderJid));
+
+    if (!def) {
+      logger.info('أمر غير معروف', {
+        command: parsed.name,
+        chat: chatJid,
+        group: isGroup ? chatJid : null,
+        from: senderJid
+      });
+
+      await replyUnknownCommand(socket, chatJid, msg);
+      return;
+    }
+
+    if (def.groupOnly && !isGroup) {
+      logger.warn('رفض أمر خارج مجموعة', {
+        command: def.name,
+        chat: chatJid,
+        from: senderJid
+      });
+
+      await replyGroupOnly(socket, chatJid, msg);
+      return;
+    }
+
+    if (def.privileged) {
+      if (!isAllowlisted) {
+        logger.warn('رفض أمر لعدم الصلاحية', {
+          command: def.name,
+          group: chatJid,
+          from: senderJid
+        });
+
+        await replyNotAllowlisted(socket, chatJid, msg);
+        return;
+      }
+
+      if (config.requireCallerAdmin) {
+        const isAdmin = await isCallerGroupAdmin(socket, chatJid, senderJid);
+        if (!isAdmin) {
+          logger.warn('رفض أمر لعدم كون المرسل مشرفًا', {
+            command: def.name,
+            group: chatJid,
+            from: senderJid
+          });
+
+          await replyNotGroupAdmin(socket, chatJid, msg);
+          return;
+        }
+      }
+    }
+
+    const resolution = resolveTargetsFromMessage(msg.message, parsed.args);
+
+    const ctx = {
+      socket,
+      msg,
+      chatJid,
+      groupJid: isGroup ? chatJid : null,
+      senderJid,
+      senderRawJid,
+      prefix: config.prefix,
+      command: def.name,
+      args: parsed.args,
+      rawArgs: parsed.rawArgs,
+      mentions: extractMentions(msg.message),
+      quotedParticipant: extractQuotedParticipant(msg.message),
+      targetJids: resolution.targets,
+      targetSource: resolution.source,
+      isAllowlisted,
+      reply: async (t) => safeSendText(socket, chatJid, t, msg)
+    };
+
+    logger.info('تنفيذ أمر', {
+      command: def.name,
+      group: chatJid,
+      from: senderJid,
+      privileged: def.privileged,
+      allowlisted: isAllowlisted
+    });
+
+    try {
+      await def.handler(ctx);
+      logger.info('تم تنفيذ الأمر', {
+        command: def.name,
+        group: chatJid,
+        from: senderJid
+      });
+    } catch (err) {
+      logger.error('فشل تنفيذ أمر', {
+        command: def.name,
+        group: chatJid,
+        from: senderJid,
+        err: String(err?.stack || err)
+      });
+
+      await safeSendText(socket, chatJid, 'حدث خطأ أثناء تنفيذ الأمر.', msg);
+    }
+  };
+
+  return { handle };
+}
