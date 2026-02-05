@@ -3,7 +3,9 @@ export function isGroupJid(jid) {
 }
 
 export function isUserJid(jid) {
-  return typeof jid === 'string' && jid.endsWith('@s.whatsapp.net');
+  return (
+    typeof jid === 'string' && (jid.endsWith('@s.whatsapp.net') || jid.endsWith('@lid'))
+  );
 }
 
 export function normalizeUserJid(jid) {
@@ -19,7 +21,11 @@ export function normalizeUserJid(jid) {
   const user = userPart.split(':')[0];
 
   if (!user || !serverPart) return null;
-  return `${user}@${serverPart}`;
+
+  const normalized = `${user}@${serverPart}`;
+  if (!isUserJid(normalized)) return null;
+
+  return normalized;
 }
 
 export function formatJids(jids, limit = 5) {
