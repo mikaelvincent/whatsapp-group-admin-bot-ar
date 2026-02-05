@@ -158,6 +158,20 @@ export async function startWhatsAppBot({ config, logger }) {
     logger: logger.child({ component: 'store' })
   });
 
+  try {
+    const seed = Array.isArray(config.allowlist) ? config.allowlist : [];
+    if (seed.length > 0) {
+      const res = await store.addAllowlist(seed);
+      if (res?.added > 0) {
+        logger.info('تمت مزامنة قائمة السماح', { added: res.added, total: res.total });
+      }
+    }
+
+    config.allowlist = store.listAllowlist();
+  } catch (err) {
+    logger.warn('فشل مزامنة قائمة السماح', { err: String(err) });
+  }
+
   const commandRouter = createCommandRouter({
     config,
     logger: logger.child({ component: 'commands' }),
