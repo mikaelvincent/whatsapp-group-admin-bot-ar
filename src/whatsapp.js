@@ -10,6 +10,8 @@ import makeWASocket, {
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 
+import { createCommandRouter } from './commands.js';
+
 async function ensureSecureDir(dirPath) {
   await fs.mkdir(dirPath, { recursive: true, mode: 0o700 });
   try {
@@ -59,34 +61,6 @@ async function secureTree(rootPath) {
   await visit(rootPath);
 }
 
-function isGroupJid(jid) {
-  return typeof jid === 'string' && jid.endsWith('@g.us');
-}
-
-function unwrapMessage(message) {
-  if (!message || typeof message !== 'object') return null;
-  if (message.ephemeralMessage?.message) return unwrapMessage(message.ephemeralMessage.message);
-  if (message.viewOnceMessage?.message) return unwrapMessage(message.viewOnceMessage.message);
-  if (message.viewOnceMessageV2?.message) return unwrapMessage(message.viewOnceMessageV2.message);
-  if (message.viewOnceMessageV2Extension?.message)
-    return unwrapMessage(message.viewOnceMessageV2Extension.message);
-  return message;
-}
-
-function extractText(message) {
-  const msg = unwrapMessage(message);
-  if (!msg) return null;
-
-  return (
-    msg.conversation ||
-    msg.extendedTextMessage?.text ||
-    msg.imageMessage?.caption ||
-    msg.videoMessage?.caption ||
-    msg.documentMessage?.caption ||
-    null
-  );
-}
-
 function computeBackoff(attempt) {
   const base = 2000;
   const max = 60000;
@@ -114,6 +88,10 @@ export async function startWhatsAppBot({ config, logger }) {
   let reconnectAttempt = 0;
 
   const baileysLogger = pino({ level: config.baileysLogLevel });
+  const commandRouter = createCommandRouter({
+    config,
+    logger: logger.child({ component: 'commands' })
+  });
 
   let waWebVersion = null;
   let waWebVersionRefreshRequested = false;
@@ -263,32 +241,7 @@ export async function startWhatsAppBot({ config, logger }) {
 
         for (const msg of messages) {
           try {
-            if (!msg?.message) continue;
-            if (msg.key?.fromMe) continue;
-
-            const jid = msg.key?.remoteJid;
-            if (!isGroupJid(jid)) continue;
-
-            const text = extractText(msg.message);
-            if (!text) continue;
-
-            const trimmed = String(text).trim();
-            const expected = `${config.prefix}ping`;
-            if (trimmed.toLowerCase() !== expected.toLowerCase()) continue;
-
-            logger.info('تنفيذ أمر', {
-              command: 'ping',
-              group: jid,
-              from: msg.key?.participant || msg.key?.remoteJid
-            });
-
-            await socket.sendMessage(
-              jid,
-              {
-                text: config.pingResponse
-              },
-              { quoted: msg }
-            );
+            await commandRouter.handle({ socket, msg });
           } catch (err) {
             logger.warn('فشل التعامل مع رسالة', { err: String(err) });
           }
