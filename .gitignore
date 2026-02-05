@@ -143,3 +143,5 @@ vite.config.ts.timestamp-*
 .mapfooter
 .mapheader
 .mapignore
+
+package-lock.json
