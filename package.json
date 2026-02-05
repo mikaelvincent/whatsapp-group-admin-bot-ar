@@ -1,0 +1,17 @@
+{
+  "name": "whatsapp-group-admin-bot-ar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.21",
+    "pino": "^10.3.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
