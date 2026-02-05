@@ -1,7 +1,12 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-const STORE_VERSION = 3;
+const STORE_VERSION = 4;
+
+const DEFAULT_WELCOME_TEMPLATE =
+  '👋 مرحبًا {user}!\n\nأهلًا بك في المجموعة.\n\n{rules}';
+
+const MAX_WELCOME_TEMPLATE_CHARS = 2000;
 
 function isGroupJid(jid) {
   return typeof jid === 'string' && jid.endsWith('@g.us');
@@ -27,6 +32,13 @@ function normalizeBannedWord(value) {
   const v = String(value ?? '').trim();
   if (!v) return null;
   return v.replace(/\s+/g, ' ');
+}
+
+function normalizeWelcomeTemplate(value) {
+  const raw = String(value ?? '').replace(/\r\n/g, '\n').trim();
+  if (!raw) return DEFAULT_WELCOME_TEMPLATE;
+  if (raw.length <= MAX_WELCOME_TEMPLATE_CHARS) return raw;
+  return raw.slice(0, MAX_WELCOME_TEMPLATE_CHARS);
 }
 
 function uniq(list) {
@@ -134,6 +146,16 @@ function ensureModerationConfig(g) {
   return m;
 }
 
+function ensureWelcomeConfig(g) {
+  if (!g.welcome || typeof g.welcome !== 'object') g.welcome = {};
+  const w = g.welcome;
+
+  if (typeof w.enabled !== 'boolean') w.enabled = false;
+  w.template = normalizeWelcomeTemplate(w.template);
+
+  return w;
+}
+
 function ensureGroup(data, groupJid) {
   if (!isGroupJid(groupJid)) return null;
   if (!data.groups[groupJid] || typeof data.groups[groupJid] !== 'object') data.groups[groupJid] = {};
@@ -143,6 +165,7 @@ function ensureGroup(data, groupJid) {
   g.bans = uniq(g.bans.map(normalizeUserJid).filter(Boolean));
 
   ensureModerationConfig(g);
+  ensureWelcomeConfig(g);
 
   if (!Array.isArray(g.bannedWords)) g.bannedWords = [];
   g.bannedWords = uniqBannedWords(g.bannedWords);
@@ -417,6 +440,37 @@ export async function createStore({ filePath, logger } = {}) {
       return { removed, total: g.bannedWords.length };
     });
 
+  const getWelcome = (groupJid) => {
+    const g = ensureGroup(data, groupJid);
+    if (!g) return null;
+
+    const w = ensureWelcomeConfig(g);
+    return { enabled: Boolean(w.enabled), template: String(w.template || DEFAULT_WELCOME_TEMPLATE) };
+  };
+
+  const setWelcomeEnabled = (groupJid, enabled) =>
+    enqueue(async () => {
+      const g = ensureGroup(data, groupJid);
+      if (!g) return { ok: false, value: false };
+
+      const w = ensureWelcomeConfig(g);
+      w.enabled = Boolean(enabled);
+      await flush();
+      return { ok: true, value: Boolean(w.enabled) };
+    });
+
+  const setWelcomeTemplate = (groupJid, template) =>
+    enqueue(async () => {
+      const g = ensureGroup(data, groupJid);
+      if (!g) return { ok: false, template: DEFAULT_WELCOME_TEMPLATE };
+
+      const w = ensureWelcomeConfig(g);
+      const next = normalizeWelcomeTemplate(template);
+      w.template = next;
+      await flush();
+      return { ok: true, template: next };
+    });
+
   return {
     path: resolvedPath,
     listBans,
@@ -436,6 +490,9 @@ export async function createStore({ filePath, logger } = {}) {
     listBannedWords,
     addBannedWord,
     removeBannedWord,
+    getWelcome,
+    setWelcomeEnabled,
+    setWelcomeTemplate,
     close: async () => {
       await opChain;
     }
