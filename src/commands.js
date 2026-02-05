@@ -172,6 +172,48 @@ function formatJids(jids, limit = 5) {
   return `${head} ... (+${ids.length - limit})`;
 }
 
+function normalizeSearchText(value) {
+  return String(value ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function findFirstLink(text) {
+  const v = String(text ?? '');
+  if (!v) return null;
+  const match = v.match(/https?:\/\/\S+|www\.\S+|\b[a-z0-9-]+\.[a-z]{2,}(?:\/\S*)?/i);
+  return match ? String(match[0] ?? '') : null;
+}
+
+function findBannedWord(text, bannedWords) {
+  const hay = normalizeSearchText(text);
+  if (!hay) return null;
+
+  for (const raw of Array.isArray(bannedWords) ? bannedWords : []) {
+    const needle = normalizeSearchText(raw);
+    if (!needle) continue;
+    if (hay.includes(needle)) return needle;
+  }
+
+  return null;
+}
+
+function detectMedia(message) {
+  const msg = unwrapMessage(message);
+  if (!msg) return { hasImage: false, hasSticker: false };
+  return {
+    hasImage: Boolean(msg.imageMessage),
+    hasSticker: Boolean(msg.stickerMessage)
+  };
+}
+
+function jidMentionTag(jid) {
+  const u = normalizeUserJid(jid);
+  const id = u ? u.split('@')[0] : '';
+  return id ? `@${id}` : '';
+}
+
 async function safeSendText(socket, jid, text, quoted, extra) {
   if (!jid) return;
 
@@ -191,6 +233,12 @@ export function createCommandRouter({ config, logger, store }) {
       .map(normalizeUserJid)
       .filter(Boolean)
   );
+
+  const warnCooldownMs = Number.isFinite(config.moderationWarnCooldownMs)
+    ? config.moderationWarnCooldownMs
+    : 15_000;
+
+  const warnCache = new Map();
 
   const groupMetaCache = new Map();
   const groupMetaTtlMs = 30_000;
@@ -264,6 +312,156 @@ export function createCommandRouter({ config, logger, store }) {
     return { ok, failed };
   };
 
+  const parseOnOff = (value) => {
+    const v = String(value ?? '')
+      .trim()
+      .toLowerCase();
+
+    if (!v) return null;
+    if (['on', 'enable', 'enabled', '1', 'true', 'yes', 'y'].includes(v)) return true;
+    if (['off', 'disable', 'disabled', '0', 'false', 'no', 'n'].includes(v)) return false;
+    return null;
+  };
+
+  const shouldSendWarning = (groupJid, senderJid, rule) => {
+    if (!warnCooldownMs || warnCooldownMs <= 0) return true;
+
+    const key = `${groupJid}|${senderJid}|${rule}`;
+    const now = Date.now();
+    const last = warnCache.get(key);
+
+    if (typeof last === 'number' && now - last < warnCooldownMs) return false;
+    warnCache.set(key, now);
+
+    if (warnCache.size > 5000) warnCache.clear();
+
+    return true;
+  };
+
+  const maybeModerateMessage = async ({ socket, msg, groupJid, senderJid, isAllowlisted, botJid }) => {
+    if (!groupJid || !senderJid) return;
+
+    const moderation = store.getModeration(groupJid);
+    if (!moderation) return;
+
+    const anyEnabled =
+      moderation.antiLink ||
+      moderation.filterEnabled ||
+      moderation.antiImage ||
+      moderation.antiSticker;
+
+    if (!anyEnabled) return;
+
+    if (moderation.exemptAllowlisted && isAllowlisted) return;
+
+    if (moderation.exemptAdmins) {
+      const check = await getAdminStatus(socket, groupJid, senderJid);
+      if (!check.ok) return;
+      if (check.isAdmin) return;
+    }
+
+    const media = detectMedia(msg.message);
+    const text = extractText(msg.message);
+
+    let rule = null;
+    let match = null;
+
+    if (moderation.antiImage && media.hasImage) {
+      rule = 'antiimage';
+    } else if (moderation.antiSticker && media.hasSticker) {
+      rule = 'antisticker';
+    } else if (moderation.filterEnabled && Array.isArray(moderation.bannedWords) && moderation.bannedWords.length > 0) {
+      const found = findBannedWord(text, moderation.bannedWords);
+      if (found) {
+        rule = 'filter';
+        match = 'banned_word';
+      }
+    } else if (moderation.antiLink) {
+      const link = findFirstLink(text);
+      if (link) {
+        rule = 'antilink';
+        match = 'link';
+      }
+    }
+
+    if (!rule) return;
+
+    let deleted = false;
+
+    if (msg?.key) {
+      let canDelete = true;
+
+      if (botJid) {
+        const botCheck = await getAdminStatus(socket, groupJid, botJid);
+        if (botCheck.ok && !botCheck.isAdmin) canDelete = false;
+      }
+
+      if (canDelete) {
+        try {
+          await socket.sendMessage(groupJid, { delete: msg.key });
+          deleted = true;
+        } catch (err) {
+          logger.warn('فشل حذف رسالة إشراف', {
+            group: groupJid,
+            from: senderJid,
+            rule,
+            err: String(err)
+          });
+        }
+      }
+    }
+
+    logger.info('تنفيذ إشراف', {
+      group: groupJid,
+      from: senderJid,
+      rule,
+      deleted,
+      match
+    });
+
+    if (!shouldSendWarning(groupJid, senderJid, rule)) return;
+
+    const tag = jidMentionTag(senderJid);
+    const mentions = tag ? [senderJid] : [];
+
+    const warningText =
+      rule === 'antilink'
+        ? `⚠️ ${tag} يُمنع إرسال الروابط في هذه المجموعة.`
+        : rule === 'filter'
+        ? `⚠️ ${tag} هذه العبارة غير مسموحة في هذه المجموعة.`
+        : rule === 'antiimage'
+        ? `⚠️ ${tag} يُمنع إرسال الصور في هذه المجموعة.`
+        : `⚠️ ${tag} يُمنع إرسال الملصقات في هذه المجموعة.`;
+
+    try {
+      await safeSendText(socket, groupJid, warningText, null, { mentions });
+    } catch (err) {
+      logger.warn('فشل إرسال تحذير إشراف', { group: groupJid, from: senderJid, rule, err: String(err) });
+    }
+  };
+
+  const renderRules = (groupJid) => {
+    const m = store.getModeration(groupJid);
+    if (!m) return 'تعذر قراءة إعدادات الإشراف لهذه المجموعة.';
+
+    const onOff = (v) => (v ? 'مفعل ✅' : 'معطل ❌');
+
+    const lines = [];
+    lines.push('📜 القواعد الحالية');
+    lines.push('');
+    lines.push(`- منع الروابط: ${onOff(m.antiLink)}`);
+    lines.push(`- فلتر الكلمات: ${onOff(m.filterEnabled)}${m.filterEnabled ? ` (عدد العناصر: ${m.bannedWords.length})` : ''}`);
+    lines.push(`- منع الصور: ${onOff(m.antiImage)}`);
+    lines.push(`- منع الملصقات: ${onOff(m.antiSticker)}`);
+    lines.push('');
+    lines.push(`- استثناء المخولين: ${onOff(m.exemptAllowlisted)}`);
+    lines.push(`- استثناء مشرفي المجموعة: ${onOff(m.exemptAdmins)}`);
+    lines.push('');
+    lines.push('ملاحظة: حذف الرسائل يحتاج أن يكون البوت مشرفًا.');
+
+    return lines.join('\n');
+  };
+
   const commands = [
     {
       name: 'help',
@@ -278,6 +476,250 @@ export function createCommandRouter({ config, logger, store }) {
             commands
           })
         );
+      }
+    },
+    {
+      name: 'rules',
+      aliases: [],
+      category: 'moderation',
+      privileged: false,
+      groupOnly: true,
+      handler: async (ctx) => {
+        await ctx.reply(renderRules(ctx.groupJid));
+      }
+    },
+    {
+      name: 'antilink',
+      aliases: [],
+      category: 'moderation',
+      privileged: true,
+      groupOnly: true,
+      handler: async (ctx) => {
+        const enabled = parseOnOff(ctx.args[0]);
+        if (enabled === null) {
+          await ctx.reply(`الاستخدام: ${ctx.prefix}antilink on|off`);
+          return;
+        }
+
+        try {
+          const res = await ctx.store.setAntiLink(ctx.groupJid, enabled);
+          if (!res?.ok) throw new Error('store_rejected');
+        } catch (err) {
+          logger.warn('فشل تحديث منع الروابط', { group: ctx.groupJid, err: String(err) });
+          await ctx.reply('حدث خطأ أثناء تحديث إعدادات منع الروابط.');
+          return;
+        }
+
+        await ctx.reply(enabled ? '✅ تم تفعيل منع الروابط.' : '✅ تم تعطيل منع الروابط.');
+      }
+    },
+    {
+      name: 'antiimage',
+      aliases: [],
+      category: 'moderation',
+      privileged: true,
+      groupOnly: true,
+      handler: async (ctx) => {
+        const enabled = parseOnOff(ctx.args[0]);
+        if (enabled === null) {
+          await ctx.reply(`الاستخدام: ${ctx.prefix}antiimage on|off`);
+          return;
+        }
+
+        try {
+          const res = await ctx.store.setAntiImage(ctx.groupJid, enabled);
+          if (!res?.ok) throw new Error('store_rejected');
+        } catch (err) {
+          logger.warn('فشل تحديث منع الصور', { group: ctx.groupJid, err: String(err) });
+          await ctx.reply('حدث خطأ أثناء تحديث إعدادات منع الصور.');
+          return;
+        }
+
+        await ctx.reply(enabled ? '✅ تم تفعيل منع الصور.' : '✅ تم تعطيل منع الصور.');
+      }
+    },
+    {
+      name: 'antisticker',
+      aliases: [],
+      category: 'moderation',
+      privileged: true,
+      groupOnly: true,
+      handler: async (ctx) => {
+        const enabled = parseOnOff(ctx.args[0]);
+        if (enabled === null) {
+          await ctx.reply(`الاستخدام: ${ctx.prefix}antisticker on|off`);
+          return;
+        }
+
+        try {
+          const res = await ctx.store.setAntiSticker(ctx.groupJid, enabled);
+          if (!res?.ok) throw new Error('store_rejected');
+        } catch (err) {
+          logger.warn('فشل تحديث منع الملصقات', { group: ctx.groupJid, err: String(err) });
+          await ctx.reply('حدث خطأ أثناء تحديث إعدادات منع الملصقات.');
+          return;
+        }
+
+        await ctx.reply(enabled ? '✅ تم تفعيل منع الملصقات.' : '✅ تم تعطيل منع الملصقات.');
+      }
+    },
+    {
+      name: 'filter',
+      aliases: [],
+      category: 'moderation',
+      privileged: true,
+      groupOnly: true,
+      handler: async (ctx) => {
+        const sub = String(ctx.args[0] ?? '')
+          .trim()
+          .toLowerCase();
+
+        const usage =
+          `الاستخدام:\n` +
+          `- ${ctx.prefix}filter on|off\n` +
+          `- ${ctx.prefix}filter add <كلمة/عبارة>\n` +
+          `- ${ctx.prefix}filter remove <كلمة/عبارة>\n` +
+          `- ${ctx.prefix}filter list`;
+
+        if (!sub) {
+          await ctx.reply(usage);
+          return;
+        }
+
+        if (sub === 'on' || sub === 'off') {
+          const enabled = sub === 'on';
+          try {
+            const res = await ctx.store.setFilterEnabled(ctx.groupJid, enabled);
+            if (!res?.ok) throw new Error('store_rejected');
+          } catch (err) {
+            logger.warn('فشل تحديث فلتر الكلمات', { group: ctx.groupJid, err: String(err) });
+            await ctx.reply('حدث خطأ أثناء تحديث إعدادات فلتر الكلمات.');
+            return;
+          }
+
+          await ctx.reply(enabled ? '✅ تم تفعيل فلتر الكلمات.' : '✅ تم تعطيل فلتر الكلمات.');
+          return;
+        }
+
+        if (sub === 'list') {
+          const words = ctx.store.listBannedWords(ctx.groupJid);
+          if (!words || words.length === 0) {
+            await ctx.reply('لا توجد كلمات/عبارات في قائمة المنع.');
+            return;
+          }
+
+          const max = 30;
+          const head = words.slice(0, max);
+          const lines = [];
+          lines.push('🚫 قائمة الكلمات/العبارات الممنوعة');
+          lines.push('');
+
+          for (let i = 0; i < head.length; i += 1) {
+            lines.push(`${i + 1}) ${head[i]}`);
+          }
+
+          if (words.length > max) lines.push(`\n... (+${words.length - max})`);
+
+          await ctx.reply(lines.join('\n'));
+          return;
+        }
+
+        if (sub === 'add') {
+          const phrase = String(ctx.args.slice(1).join(' ') ?? '').trim();
+          if (!phrase) {
+            await ctx.reply(`اكتب العبارة بعد الأمر.\nمثال: ${ctx.prefix}filter add كلمة`);
+            return;
+          }
+
+          if (phrase.length > 200) {
+            await ctx.reply('العبارة طويلة جدًا. حاول تقصيرها.');
+            return;
+          }
+
+          let res;
+          try {
+            res = await ctx.store.addBannedWord(ctx.groupJid, phrase);
+          } catch (err) {
+            logger.warn('فشل إضافة كلمة ممنوعة', { group: ctx.groupJid, err: String(err) });
+            await ctx.reply('حدث خطأ أثناء تحديث قائمة المنع.');
+            return;
+          }
+
+          if (res?.added) {
+            await ctx.reply(`✅ تم إضافة العبارة إلى قائمة المنع. (الإجمالي: ${res.total})`);
+            return;
+          }
+
+          await ctx.reply('هذه العبارة موجودة بالفعل في قائمة المنع.');
+          return;
+        }
+
+        if (sub === 'remove' || sub === 'del' || sub === 'delete') {
+          const phrase = String(ctx.args.slice(1).join(' ') ?? '').trim();
+          if (!phrase) {
+            await ctx.reply(`اكتب العبارة بعد الأمر.\nمثال: ${ctx.prefix}filter remove كلمة`);
+            return;
+          }
+
+          let res;
+          try {
+            res = await ctx.store.removeBannedWord(ctx.groupJid, phrase);
+          } catch (err) {
+            logger.warn('فشل إزالة كلمة ممنوعة', { group: ctx.groupJid, err: String(err) });
+            await ctx.reply('حدث خطأ أثناء تحديث قائمة المنع.');
+            return;
+          }
+
+          if (res?.removed) {
+            await ctx.reply(`✅ تم حذف العبارة من قائمة المنع. (الإجمالي: ${res.total})`);
+            return;
+          }
+
+          await ctx.reply('هذه العبارة غير موجودة في قائمة المنع.');
+          return;
+        }
+
+        await ctx.reply(usage);
+      }
+    },
+    {
+      name: 'exempt',
+      aliases: [],
+      category: 'moderation',
+      privileged: true,
+      groupOnly: true,
+      handler: async (ctx) => {
+        const kind = String(ctx.args[0] ?? '')
+          .trim()
+          .toLowerCase();
+        const enabled = parseOnOff(ctx.args[1]);
+
+        if (!kind || enabled === null) {
+          await ctx.reply(`الاستخدام: ${ctx.prefix}exempt allowlist|admins on|off`);
+          return;
+        }
+
+        const isAllowlist = ['allowlist', 'allowlisted', 'allowed'].includes(kind);
+        const isAdmins = ['admins', 'admin', 'groupadmins', 'groupadmin'].includes(kind);
+
+        if (!isAllowlist && !isAdmins) {
+          await ctx.reply(`الاستخدام: ${ctx.prefix}exempt allowlist|admins on|off`);
+          return;
+        }
+
+        try {
+          const res = isAllowlist
+            ? await ctx.store.setExemptAllowlisted(ctx.groupJid, enabled)
+            : await ctx.store.setExemptAdmins(ctx.groupJid, enabled);
+          if (!res?.ok) throw new Error('store_rejected');
+        } catch (err) {
+          logger.warn('فشل تحديث الاستثناءات', { group: ctx.groupJid, err: String(err) });
+          await ctx.reply('حدث خطأ أثناء تحديث إعدادات الاستثناءات.');
+          return;
+        }
+
+        const label = isAllowlist ? 'المخولين' : 'مشرفي المجموعة';
+        await ctx.reply(enabled ? `✅ تم تفعيل استثناء ${label}.` : `✅ تم تعطيل استثناء ${label}.`);
       }
     },
     {
@@ -336,7 +778,9 @@ export function createCommandRouter({ config, logger, store }) {
         if (res.ok.length > 0) lines.push(`✅ تم إخراج ${res.ok.length} عضو/أعضاء.`);
         if (res.failed.length > 0) {
           const failedList = formatJids(res.failed.map((f) => f.jid));
-          lines.push(`⚠️ تعذر إخراج ${res.failed.length} عضو/أعضاء.${failedList ? `\nالذين تعذر إخراجهم: ${failedList}` : ''}`);
+          lines.push(
+            `⚠️ تعذر إخراج ${res.failed.length} عضو/أعضاء.${failedList ? `\nالذين تعذر إخراجهم: ${failedList}` : ''}`
+          );
         }
 
         await ctx.reply(lines.join('\n'));
@@ -393,7 +837,9 @@ export function createCommandRouter({ config, logger, store }) {
 
         if (res.failed.length > 0) {
           const failedList = formatJids(res.failed.map((f) => f.jid));
-          lines.push(`⚠️ تعذر إخراج ${res.failed.length} عضو/أعضاء.${failedList ? `\nالذين تعذر إخراجهم: ${failedList}` : ''}`);
+          lines.push(
+            `⚠️ تعذر إخراج ${res.failed.length} عضو/أعضاء.${failedList ? `\nالذين تعذر إخراجهم: ${failedList}` : ''}`
+          );
         }
 
         if (lines.length === 0) {
@@ -445,7 +891,9 @@ export function createCommandRouter({ config, logger, store }) {
         const targets = sanitizeTargets(ctx.socket, ctx.targetJids);
 
         if (targets.length === 0) {
-          await ctx.reply(`لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}promote @شخص`);
+          await ctx.reply(
+            `لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}promote @شخص`
+          );
           return;
         }
 
@@ -460,7 +908,9 @@ export function createCommandRouter({ config, logger, store }) {
         if (res.ok.length > 0) lines.push(`✅ تم ترقية ${res.ok.length} عضو/أعضاء إلى مشرف.`);
         if (res.failed.length > 0) {
           const failedList = formatJids(res.failed.map((f) => f.jid));
-          lines.push(`⚠️ تعذر ترقية ${res.failed.length} عضو/أعضاء.${failedList ? `\nالذين تعذر ترقيتهم: ${failedList}` : ''}`);
+          lines.push(
+            `⚠️ تعذر ترقية ${res.failed.length} عضو/أعضاء.${failedList ? `\nالذين تعذر ترقيتهم: ${failedList}` : ''}`
+          );
         }
 
         await ctx.reply(lines.join('\n'));
@@ -477,7 +927,9 @@ export function createCommandRouter({ config, logger, store }) {
         const targets = sanitizeTargets(ctx.socket, ctx.targetJids);
 
         if (targets.length === 0) {
-          await ctx.reply(`لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}demote @شخص`);
+          await ctx.reply(
+            `لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}demote @شخص`
+          );
           return;
         }
 
@@ -492,7 +944,9 @@ export function createCommandRouter({ config, logger, store }) {
         if (res.ok.length > 0) lines.push(`✅ تم تنزيل ${res.ok.length} مشرف/مشرفين.`);
         if (res.failed.length > 0) {
           const failedList = formatJids(res.failed.map((f) => f.jid));
-          lines.push(`⚠️ تعذر تنزيل ${res.failed.length} عضو/أعضاء.${failedList ? `\nالذين تعذر تنزيلهم: ${failedList}` : ''}`);
+          lines.push(
+            `⚠️ تعذر تنزيل ${res.failed.length} عضو/أعضاء.${failedList ? `\nالذين تعذر تنزيلهم: ${failedList}` : ''}`
+          );
         }
 
         await ctx.reply(lines.join('\n'));
@@ -571,20 +1025,33 @@ export function createCommandRouter({ config, logger, store }) {
     if (!chatJid || chatJid === 'status@broadcast') return;
     if (!isGroupJid(chatJid) && !isUserJid(chatJid)) return;
 
-    const text = extractText(msg.message);
-    if (!text) return;
-
-    const parsed = parseCommand(text, config.prefix);
-    if (!parsed) return;
-
-    const def = commandIndex.get(parsed.name);
-
     const isGroup = isGroupJid(chatJid);
     const senderRawJid = isGroup ? msg.key?.participant : msg.key?.remoteJid;
     const senderJid = normalizeUserJid(senderRawJid);
 
     const isAllowlisted = Boolean(senderJid && allowlist.has(senderJid));
     const botJid = getBotJid(socket);
+
+    if (isGroup && senderJid) {
+      try {
+        await maybeModerateMessage({
+          socket,
+          msg,
+          groupJid: chatJid,
+          senderJid,
+          isAllowlisted,
+          botJid
+        });
+      } catch (err) {
+        logger.warn('فشل تنفيذ إشراف', { group: chatJid, from: senderJid, err: String(err) });
+      }
+    }
+
+    const text = extractText(msg.message);
+    const parsed = parseCommand(text, config.prefix);
+    if (!parsed) return;
+
+    const def = commandIndex.get(parsed.name);
 
     if (!def) {
       logger.info('أمر غير معروف', {
