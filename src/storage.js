@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-const STORE_VERSION = 4;
+const STORE_VERSION = 5;
 
 const DEFAULT_WELCOME_TEMPLATE =
   '👋 مرحبًا {user}!\n\nأهلًا بك في المجموعة.\n\n{rules}';
@@ -43,6 +43,10 @@ function normalizeWelcomeTemplate(value) {
 
 function uniq(list) {
   return Array.from(new Set(list));
+}
+
+function normalizeAllowlist(list) {
+  return uniq((Array.isArray(list) ? list : []).map(normalizeUserJid).filter(Boolean));
 }
 
 function uniqBannedWords(list) {
@@ -129,7 +133,8 @@ async function readJson(filePath) {
 function normalizeStoreData(value) {
   const v = value && typeof value === 'object' ? value : null;
   const groups = v && typeof v.groups === 'object' && v.groups ? v.groups : {};
-  return { version: STORE_VERSION, groups };
+  const allowlist = v && Array.isArray(v.allowlist) ? v.allowlist : [];
+  return { version: STORE_VERSION, groups, allowlist: normalizeAllowlist(allowlist) };
 }
 
 function ensureModerationConfig(g) {
@@ -206,6 +211,62 @@ export async function createStore({ filePath, logger } = {}) {
     const json = JSON.stringify(data, null, 2);
     await writeAtomic(resolvedPath, `${json}\n`);
   };
+
+  const listAllowlist = () => {
+    const raw = Array.isArray(data.allowlist) ? data.allowlist : [];
+    return [...raw];
+  };
+
+  const isAllowlisted = (userJid) => {
+    const u = normalizeUserJid(userJid);
+    if (!u) return false;
+    const raw = Array.isArray(data.allowlist) ? data.allowlist : [];
+    return raw.includes(u);
+  };
+
+  const addAllowlist = (userJids) =>
+    enqueue(async () => {
+      if (!Array.isArray(data.allowlist)) data.allowlist = [];
+
+      const before = new Set(data.allowlist);
+      const incoming = uniq(
+        (Array.isArray(userJids) ? userJids : []).map(normalizeUserJid).filter(Boolean)
+      );
+
+      let added = 0;
+      for (const jid of incoming) {
+        if (before.has(jid)) continue;
+        before.add(jid);
+        added += 1;
+      }
+
+      if (added === 0) return { added: 0, total: before.size };
+
+      data.allowlist = Array.from(before);
+      await flush();
+      return { added, total: data.allowlist.length };
+    });
+
+  const removeAllowlist = (userJids) =>
+    enqueue(async () => {
+      if (!Array.isArray(data.allowlist)) data.allowlist = [];
+
+      const before = new Set(data.allowlist);
+      const incoming = uniq(
+        (Array.isArray(userJids) ? userJids : []).map(normalizeUserJid).filter(Boolean)
+      );
+
+      let removed = 0;
+      for (const jid of incoming) {
+        if (before.delete(jid)) removed += 1;
+      }
+
+      if (removed === 0) return { removed: 0, total: before.size };
+
+      data.allowlist = Array.from(before);
+      await flush();
+      return { removed, total: data.allowlist.length };
+    });
 
   const listBans = (groupJid) => {
     const g = ensureGroup(data, groupJid);
@@ -473,6 +534,10 @@ export async function createStore({ filePath, logger } = {}) {
 
   return {
     path: resolvedPath,
+    listAllowlist,
+    isAllowlisted,
+    addAllowlist,
+    removeAllowlist,
     listBans,
     isBanned,
     addBans,
