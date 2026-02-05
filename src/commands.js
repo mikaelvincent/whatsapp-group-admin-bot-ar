@@ -107,9 +107,14 @@ function resolveTargetsFromMessage(message, args) {
     return { targets: [quoted], source: 'reply' };
   }
 
+  const numberTargets = [];
   for (const a of Array.isArray(args) ? args : []) {
     const jid = normalizePhoneTarget(a);
-    if (jid) return { targets: [jid], source: 'number' };
+    if (jid) numberTargets.push(jid);
+  }
+
+  if (numberTargets.length > 0) {
+    return { targets: Array.from(new Set(numberTargets)), source: 'number' };
   }
 
   return { targets: [], source: null };
@@ -156,12 +161,31 @@ function renderHelp({ prefix, commands }) {
   return lines.join('\n');
 }
 
-async function safeSendText(socket, jid, text, quoted) {
-  if (!jid) return;
-  await socket.sendMessage(jid, { text: String(text ?? '') }, quoted ? { quoted } : undefined);
+function formatJids(jids, limit = 5) {
+  const raw = Array.isArray(jids) ? jids : [];
+  const normalized = raw.map(normalizeUserJid).filter(Boolean);
+  const ids = normalized.map((jid) => jid.split('@')[0]).filter(Boolean);
+
+  if (ids.length === 0) return '';
+  const head = ids.slice(0, limit).join(', ');
+  if (ids.length <= limit) return head;
+  return `${head} ... (+${ids.length - limit})`;
 }
 
-export function createCommandRouter({ config, logger }) {
+async function safeSendText(socket, jid, text, quoted, extra) {
+  if (!jid) return;
+
+  const message = { text: String(text ?? '') };
+  if (extra?.mentions && Array.isArray(extra.mentions) && extra.mentions.length > 0) {
+    message.mentions = extra.mentions;
+  }
+
+  await socket.sendMessage(jid, message, quoted ? { quoted } : undefined);
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export function createCommandRouter({ config, logger, store }) {
   const allowlist = new Set(
     (Array.isArray(config.allowlist) ? config.allowlist : [])
       .map(normalizeUserJid)
@@ -182,26 +206,62 @@ export function createCommandRouter({ config, logger }) {
     return data;
   };
 
-  const isCallerGroupAdmin = async (socket, groupJid, callerJid) => {
-    if (!groupJid || !callerJid) return false;
+  const getAdminStatus = async (socket, groupJid, userJid) => {
+    if (!groupJid || !userJid) return { ok: true, isAdmin: false };
 
     try {
       const meta = await getGroupMetadata(socket, groupJid);
       const parts = meta?.participants;
-      if (!Array.isArray(parts)) return false;
+      if (!Array.isArray(parts)) return { ok: true, isAdmin: false };
 
-      const normalizedCaller = normalizeUserJid(callerJid);
+      const normalized = normalizeUserJid(userJid);
 
-      return parts.some((p) => {
+      for (const p of parts) {
         const pid = normalizeUserJid(p?.id || p?.jid || p?.participant || null);
-        if (!pid) return false;
-        if (pid !== normalizedCaller) return false;
-        return Boolean(p?.admin);
-      });
+        if (!pid) continue;
+        if (pid !== normalized) continue;
+        return { ok: true, isAdmin: Boolean(p?.admin) };
+      }
+
+      return { ok: true, isAdmin: false };
     } catch (err) {
       logger.warn('فشل التحقق من مشرفي المجموعة', { err: String(err) });
-      return false;
+      return { ok: false, isAdmin: false };
     }
+  };
+
+  const getBotJid = (socket) => {
+    const raw = socket?.user?.id || socket?.user?.jid || null;
+    return normalizeUserJid(raw || null);
+  };
+
+  const sanitizeTargets = (socket, targets) => {
+    const botJid = getBotJid(socket);
+    const unique = Array.from(
+      new Set((Array.isArray(targets) ? targets : []).map(normalizeUserJid).filter(Boolean))
+    );
+
+    return unique.filter((jid) => isUserJid(jid) && (!botJid || jid !== botJid));
+  };
+
+  const runGroupAction = async ({ socket, groupJid, action, targets }) => {
+    const ok = [];
+    const failed = [];
+
+    for (let i = 0; i < targets.length; i += 1) {
+      const jid = targets[i];
+
+      try {
+        await socket.groupParticipantsUpdate(groupJid, [jid], action);
+        ok.push(jid);
+      } catch (err) {
+        failed.push({ jid, err: String(err) });
+      }
+
+      if (i + 1 < targets.length) await sleep(350);
+    }
+
+    return { ok, failed };
   };
 
   const commands = [
@@ -251,13 +311,191 @@ export function createCommandRouter({ config, logger }) {
       }
     },
     {
-      name: 'secure',
-      aliases: ['adminonly'],
+      name: 'kick',
+      aliases: [],
+      category: 'admin',
+      privileged: true,
+      groupOnly: true,
+      requiresBotAdmin: true,
+      handler: async (ctx) => {
+        const targets = sanitizeTargets(ctx.socket, ctx.targetJids);
+
+        if (targets.length === 0) {
+          await ctx.reply(`لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}kick @شخص`);
+          return;
+        }
+
+        const res = await runGroupAction({
+          socket: ctx.socket,
+          groupJid: ctx.groupJid,
+          action: 'remove',
+          targets
+        });
+
+        const lines = [];
+        if (res.ok.length > 0) lines.push(`✅ تم إخراج ${res.ok.length} عضو/أعضاء.`);
+        if (res.failed.length > 0) {
+          const failedList = formatJids(res.failed.map((f) => f.jid));
+          lines.push(`⚠️ تعذر إخراج ${res.failed.length} عضو/أعضاء.${failedList ? `\nالذين تعذر إخراجهم: ${failedList}` : ''}`);
+        }
+
+        await ctx.reply(lines.join('\n'));
+      }
+    },
+    {
+      name: 'ban',
+      aliases: [],
+      category: 'admin',
+      privileged: true,
+      groupOnly: true,
+      requiresBotAdmin: true,
+      handler: async (ctx) => {
+        const targets = sanitizeTargets(ctx.socket, ctx.targetJids);
+
+        if (targets.length === 0) {
+          await ctx.reply(`لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}ban @شخص`);
+          return;
+        }
+
+        const res = await runGroupAction({
+          socket: ctx.socket,
+          groupJid: ctx.groupJid,
+          action: 'remove',
+          targets
+        });
+
+        let storeResult = null;
+        let storeErr = null;
+
+        if (res.ok.length > 0) {
+          try {
+            storeResult = await ctx.store.addBans(ctx.groupJid, res.ok);
+          } catch (err) {
+            storeErr = err;
+          }
+        }
+
+        const lines = [];
+
+        if (res.ok.length > 0) {
+          lines.push(`✅ تم إخراج ${res.ok.length} عضو/أعضاء.`);
+        }
+
+        if (storeResult) {
+          if (storeResult.added > 0) {
+            lines.push(`🚫 تم حفظ الحظر الدائم لـ ${storeResult.added} عضو/أعضاء.`);
+          } else {
+            lines.push('🚫 الأهداف موجودة بالفعل في قائمة الحظر الدائم.');
+          }
+        } else if (res.ok.length > 0 && storeErr) {
+          lines.push('⚠️ تم الإخراج لكن تعذر حفظ الحظر الدائم.');
+        }
+
+        if (res.failed.length > 0) {
+          const failedList = formatJids(res.failed.map((f) => f.jid));
+          lines.push(`⚠️ تعذر إخراج ${res.failed.length} عضو/أعضاء.${failedList ? `\nالذين تعذر إخراجهم: ${failedList}` : ''}`);
+        }
+
+        if (lines.length === 0) {
+          await ctx.reply('لم يتم تنفيذ أي إجراء.');
+          return;
+        }
+
+        await ctx.reply(lines.join('\n'));
+      }
+    },
+    {
+      name: 'unban',
+      aliases: [],
       category: 'admin',
       privileged: true,
       groupOnly: true,
       handler: async (ctx) => {
-        await ctx.reply('✅ تم تنفيذ الأمر المحمي بنجاح.');
+        const targets = sanitizeTargets(ctx.socket, ctx.targetJids);
+
+        if (targets.length === 0) {
+          await ctx.reply(`لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}unban @شخص`);
+          return;
+        }
+
+        let result;
+        try {
+          result = await ctx.store.removeBans(ctx.groupJid, targets);
+        } catch (err) {
+          await ctx.reply('حدث خطأ أثناء تحديث قائمة الحظر.');
+          return;
+        }
+
+        if (result.removed === 0) {
+          await ctx.reply('لا يوجد حظر على الأهداف المحددة.');
+          return;
+        }
+
+        await ctx.reply(`✅ تم إلغاء الحظر عن ${result.removed} عضو/أعضاء.`);
+      }
+    },
+    {
+      name: 'promote',
+      aliases: [],
+      category: 'admin',
+      privileged: true,
+      groupOnly: true,
+      requiresBotAdmin: true,
+      handler: async (ctx) => {
+        const targets = sanitizeTargets(ctx.socket, ctx.targetJids);
+
+        if (targets.length === 0) {
+          await ctx.reply(`لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}promote @شخص`);
+          return;
+        }
+
+        const res = await runGroupAction({
+          socket: ctx.socket,
+          groupJid: ctx.groupJid,
+          action: 'promote',
+          targets
+        });
+
+        const lines = [];
+        if (res.ok.length > 0) lines.push(`✅ تم ترقية ${res.ok.length} عضو/أعضاء إلى مشرف.`);
+        if (res.failed.length > 0) {
+          const failedList = formatJids(res.failed.map((f) => f.jid));
+          lines.push(`⚠️ تعذر ترقية ${res.failed.length} عضو/أعضاء.${failedList ? `\nالذين تعذر ترقيتهم: ${failedList}` : ''}`);
+        }
+
+        await ctx.reply(lines.join('\n'));
+      }
+    },
+    {
+      name: 'demote',
+      aliases: [],
+      category: 'admin',
+      privileged: true,
+      groupOnly: true,
+      requiresBotAdmin: true,
+      handler: async (ctx) => {
+        const targets = sanitizeTargets(ctx.socket, ctx.targetJids);
+
+        if (targets.length === 0) {
+          await ctx.reply(`لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}demote @شخص`);
+          return;
+        }
+
+        const res = await runGroupAction({
+          socket: ctx.socket,
+          groupJid: ctx.groupJid,
+          action: 'demote',
+          targets
+        });
+
+        const lines = [];
+        if (res.ok.length > 0) lines.push(`✅ تم تنزيل ${res.ok.length} مشرف/مشرفين.`);
+        if (res.failed.length > 0) {
+          const failedList = formatJids(res.failed.map((f) => f.jid));
+          lines.push(`⚠️ تعذر تنزيل ${res.failed.length} عضو/أعضاء.${failedList ? `\nالذين تعذر تنزيلهم: ${failedList}` : ''}`);
+        }
+
+        await ctx.reply(lines.join('\n'));
       }
     },
     {
@@ -317,6 +555,14 @@ export function createCommandRouter({ config, logger }) {
     await safeSendText(socket, jid, 'عذرًا، هذا الأمر متاح لمشرفي المجموعة فقط.', quoted);
   };
 
+  const replyCannotVerifyAdmin = async (socket, jid, quoted) => {
+    await safeSendText(socket, jid, 'تعذر التحقق من صلاحيات المشرفين حاليًا. حاول لاحقًا.', quoted);
+  };
+
+  const replyBotNotAdmin = async (socket, jid, quoted) => {
+    await safeSendText(socket, jid, 'لا يمكن تنفيذ الأمر لأن البوت ليس مشرفًا في المجموعة.', quoted);
+  };
+
   const handle = async ({ socket, msg }) => {
     if (!msg?.message) return;
     if (msg.key?.fromMe) return;
@@ -338,6 +584,7 @@ export function createCommandRouter({ config, logger }) {
     const senderJid = normalizeUserJid(senderRawJid);
 
     const isAllowlisted = Boolean(senderJid && allowlist.has(senderJid));
+    const botJid = getBotJid(socket);
 
     if (!def) {
       logger.info('أمر غير معروف', {
@@ -375,8 +622,19 @@ export function createCommandRouter({ config, logger }) {
       }
 
       if (config.requireCallerAdmin) {
-        const isAdmin = await isCallerGroupAdmin(socket, chatJid, senderJid);
-        if (!isAdmin) {
+        const check = await getAdminStatus(socket, chatJid, senderJid);
+        if (!check.ok) {
+          logger.warn('فشل التحقق من صلاحية المرسل', {
+            command: def.name,
+            group: chatJid,
+            from: senderJid
+          });
+
+          await replyCannotVerifyAdmin(socket, chatJid, msg);
+          return;
+        }
+
+        if (!check.isAdmin) {
           logger.warn('رفض أمر لعدم كون المرسل مشرفًا', {
             command: def.name,
             group: chatJid,
@@ -384,6 +642,32 @@ export function createCommandRouter({ config, logger }) {
           });
 
           await replyNotGroupAdmin(socket, chatJid, msg);
+          return;
+        }
+      }
+
+      if (def.requiresBotAdmin) {
+        if (!botJid) {
+          logger.warn('فشل تحديد هوية البوت', { command: def.name, group: chatJid });
+          await replyCannotVerifyAdmin(socket, chatJid, msg);
+          return;
+        }
+
+        const check = await getAdminStatus(socket, chatJid, botJid);
+        if (!check.ok) {
+          logger.warn('فشل التحقق من صلاحية البوت', { command: def.name, group: chatJid });
+          await replyCannotVerifyAdmin(socket, chatJid, msg);
+          return;
+        }
+
+        if (!check.isAdmin) {
+          logger.warn('رفض أمر لأن البوت ليس مشرفًا', {
+            command: def.name,
+            group: chatJid,
+            from: senderJid
+          });
+
+          await replyBotNotAdmin(socket, chatJid, msg);
           return;
         }
       }
@@ -398,6 +682,7 @@ export function createCommandRouter({ config, logger }) {
       groupJid: isGroup ? chatJid : null,
       senderJid,
       senderRawJid,
+      botJid,
       prefix: config.prefix,
       command: def.name,
       args: parsed.args,
@@ -407,7 +692,8 @@ export function createCommandRouter({ config, logger }) {
       targetJids: resolution.targets,
       targetSource: resolution.source,
       isAllowlisted,
-      reply: async (t) => safeSendText(socket, chatJid, t, msg)
+      store,
+      reply: async (t, extra) => safeSendText(socket, chatJid, t, msg, extra)
     };
 
     logger.info('تنفيذ أمر', {
