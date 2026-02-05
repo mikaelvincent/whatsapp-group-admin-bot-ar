@@ -11,14 +11,13 @@ import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 
 import { createCommandRouter } from './commands.js';
+import { createStore } from './storage.js';
 
 async function ensureSecureDir(dirPath) {
   await fs.mkdir(dirPath, { recursive: true, mode: 0o700 });
   try {
     await fs.chmod(dirPath, 0o700);
-  } catch {
-    // Ignore permission errors; operator may run on a FS that doesn't support chmod.
-  }
+  } catch {}
 }
 
 async function secureTree(rootPath) {
@@ -36,27 +35,21 @@ async function secureTree(rootPath) {
         if (ent.isDirectory()) {
           try {
             await fs.chmod(full, 0o700);
-          } catch {
-            // ignore
-          }
+          } catch {}
           await visit(full);
           return;
         }
 
         try {
           await fs.chmod(full, 0o600);
-        } catch {
-          // ignore
-        }
+        } catch {}
       })
     );
   };
 
   try {
     await fs.chmod(rootPath, 0o700);
-  } catch {
-    // ignore
-  }
+  } catch {}
 
   await visit(rootPath);
 }
@@ -88,9 +81,16 @@ export async function startWhatsAppBot({ config, logger }) {
   let reconnectAttempt = 0;
 
   const baileysLogger = pino({ level: config.baileysLogLevel });
+
+  const store = await createStore({
+    filePath: config.storagePath,
+    logger: logger.child({ component: 'store' })
+  });
+
   const commandRouter = createCommandRouter({
     config,
-    logger: logger.child({ component: 'commands' })
+    logger: logger.child({ component: 'commands' }),
+    store
   });
 
   let waWebVersion = null;
@@ -108,15 +108,11 @@ export async function startWhatsAppBot({ config, logger }) {
       socket.ev.removeAllListeners('connection.update');
       socket.ev.removeAllListeners('creds.update');
       socket.ev.removeAllListeners('messages.upsert');
-    } catch {
-      // ignore
-    }
+    } catch {}
 
     try {
       socket.ws.close();
-    } catch {
-      // ignore
-    }
+    } catch {}
     socket = null;
   };
 
@@ -131,8 +127,6 @@ export async function startWhatsAppBot({ config, logger }) {
     const now = Date.now();
     if (now < waWebVersionFetchBlockedUntilMs) return;
 
-    // Only override the WA Web version when servers start rejecting the built-in one (405/503),
-    // to reduce the chance of using a too-new version with incompatible protobufs.
     try {
       const res = await fetchLatestWaWebVersion({});
       if (res?.error) throw res.error;
@@ -260,6 +254,7 @@ export async function startWhatsAppBot({ config, logger }) {
       stopped = true;
       clearReconnectTimer();
       await stopSocket();
+      await store.close();
     }
   };
 }
