@@ -19,6 +19,58 @@ function normalizePrefix(prefix) {
   return v || '!';
 }
 
+function parseBoolean(value, fallback = false) {
+  const v = String(value ?? '').trim().toLowerCase();
+  if (!v) return fallback;
+  if (['1', 'true', 'yes', 'y', 'on'].includes(v)) return true;
+  if (['0', 'false', 'no', 'n', 'off'].includes(v)) return false;
+  return fallback;
+}
+
+function normalizeUserJid(jid) {
+  if (typeof jid !== 'string') return null;
+  const trimmed = jid.trim();
+  if (!trimmed) return null;
+
+  const at = trimmed.indexOf('@');
+  if (at === -1) return null;
+
+  const userPart = trimmed.slice(0, at);
+  const serverPart = trimmed.slice(at + 1).toLowerCase();
+  const user = userPart.split(':')[0];
+
+  if (!user || !serverPart) return null;
+  return `${user}@${serverPart}`;
+}
+
+function normalizeAllowlistEntry(value) {
+  const v = String(value ?? '').trim();
+  if (!v) return null;
+
+  if (v.includes('@')) return normalizeUserJid(v);
+
+  const digits = v.replace(/\D/g, '');
+  if (!digits) return null;
+
+  return normalizeUserJid(`${digits}@s.whatsapp.net`);
+}
+
+function parseAllowlist(value) {
+  const v = String(value ?? '').trim();
+  if (!v) return [];
+
+  const out = [];
+  const parts = v.split(/[\s,]+/).map((p) => p.trim());
+
+  for (const p of parts) {
+    if (!p) continue;
+    const jid = normalizeAllowlistEntry(p);
+    if (jid) out.push(jid);
+  }
+
+  return Array.from(new Set(out));
+}
+
 export function loadConfig() {
   const prefix = normalizePrefix(readEnv('BOT_PREFIX', '!'));
   const authDir = path.resolve(process.cwd(), readEnv('BOT_AUTH_DIR', './data/auth'));
@@ -26,11 +78,16 @@ export function loadConfig() {
   const baileysLogLevel = parseLogLevel(readEnv('BAILEYS_LOG_LEVEL', 'warn'), 'warn');
   const pingResponse = readEnv('BOT_PING_RESPONSE', '🏓 بونج! البوت يعمل ✅');
 
+  const allowlist = parseAllowlist(readEnv('BOT_ALLOWLIST', ''));
+  const requireCallerAdmin = parseBoolean(readEnv('BOT_REQUIRE_CALLER_ADMIN', 'false'), false);
+
   return {
     prefix,
     authDir,
     logLevel,
     baileysLogLevel,
-    pingResponse
+    pingResponse,
+    allowlist,
+    requireCallerAdmin
   };
 }
