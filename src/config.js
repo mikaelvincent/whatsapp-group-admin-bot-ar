@@ -27,6 +27,12 @@ function parseBoolean(value, fallback = false) {
   return fallback;
 }
 
+function parsePositiveInt(value, fallback) {
+  const n = Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return n;
+}
+
 function normalizeUserJid(jid) {
   if (typeof jid !== 'string') return null;
   const trimmed = jid.trim();
@@ -81,6 +87,10 @@ export function loadConfig() {
 
   const allowlist = parseAllowlist(readEnv('BOT_ALLOWLIST', ''));
   const requireCallerAdmin = parseBoolean(readEnv('BOT_REQUIRE_CALLER_ADMIN', 'false'), false);
+  const moderationWarnCooldownMs = parsePositiveInt(
+    readEnv('BOT_MOD_WARN_COOLDOWN_MS', '15000'),
+    15000
+  );
 
   return {
     prefix,
@@ -90,6 +100,7 @@ export function loadConfig() {
     baileysLogLevel,
     pingResponse,
     allowlist,
-    requireCallerAdmin
+    requireCallerAdmin,
+    moderationWarnCooldownMs
   };
 }
