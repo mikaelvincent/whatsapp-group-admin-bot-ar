@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-const STORE_VERSION = 2;
+const STORE_VERSION = 3;
 
 function isGroupJid(jid) {
   return typeof jid === 'string' && jid.endsWith('@g.us');
@@ -44,6 +44,44 @@ function uniqBannedWords(list) {
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(v);
+  }
+
+  return out;
+}
+
+function normalizeMuteEntry(value, now) {
+  if (value === null || value === undefined) return { until: null };
+
+  if (typeof value === 'number' || typeof value === 'string') {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= now) return null;
+    return { until: n };
+  }
+
+  const v = value && typeof value === 'object' ? value : null;
+  if (!v) return null;
+
+  if (!Object.prototype.hasOwnProperty.call(v, 'until')) return { until: null };
+
+  if (v.until === null || v.until === undefined) return { until: null };
+
+  const until = Number(v.until);
+  if (!Number.isFinite(until) || until <= now) return null;
+  return { until };
+}
+
+function normalizeMuteMap(value, now) {
+  const src = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const out = {};
+
+  for (const [k, v] of Object.entries(src)) {
+    const jid = normalizeUserJid(k);
+    if (!jid) continue;
+
+    const entry = normalizeMuteEntry(v, now);
+    if (!entry) continue;
+
+    out[jid] = entry;
   }
 
   return out;
@@ -108,6 +146,8 @@ function ensureGroup(data, groupJid) {
 
   if (!Array.isArray(g.bannedWords)) g.bannedWords = [];
   g.bannedWords = uniqBannedWords(g.bannedWords);
+
+  g.mutes = normalizeMuteMap(g.mutes, Date.now());
 
   return g;
 }
@@ -196,6 +236,93 @@ export async function createStore({ filePath, logger } = {}) {
       g.bans = Array.from(before);
       await flush();
       return { removed, total: g.bans.length };
+    });
+
+  const getMute = (groupJid, userJid) => {
+    const g = ensureGroup(data, groupJid);
+    const u = normalizeUserJid(userJid);
+    if (!g || !u) return { muted: false, until: null };
+
+    const entry = g.mutes && typeof g.mutes === 'object' ? g.mutes[u] : null;
+    if (!entry) return { muted: false, until: null };
+
+    const until = entry.until === null || entry.until === undefined ? null : Number(entry.until);
+    if (until === null) return { muted: true, until: null };
+
+    const now = Date.now();
+    if (!Number.isFinite(until) || until <= now) {
+      delete g.mutes[u];
+      return { muted: false, until: null };
+    }
+
+    return { muted: true, until };
+  };
+
+  const addMutes = (groupJid, userJids, untilMs) =>
+    enqueue(async () => {
+      const g = ensureGroup(data, groupJid);
+      if (!g) return { added: 0, updated: 0, total: 0 };
+
+      const now = Date.now();
+      const until = untilMs === null || untilMs === undefined ? null : Number(untilMs);
+
+      if (until !== null && (!Number.isFinite(until) || until <= now)) {
+        return { added: 0, updated: 0, total: Object.keys(g.mutes || {}).length };
+      }
+
+      const incoming = uniq(
+        (Array.isArray(userJids) ? userJids : []).map(normalizeUserJid).filter(Boolean)
+      );
+
+      let added = 0;
+      let updated = 0;
+
+      if (!g.mutes || typeof g.mutes !== 'object' || Array.isArray(g.mutes)) g.mutes = {};
+
+      for (const jid of incoming) {
+        const prev = g.mutes[jid];
+        if (!prev) {
+          g.mutes[jid] = { until };
+          added += 1;
+          continue;
+        }
+
+        const prevUntil = prev.until === null || prev.until === undefined ? null : Number(prev.until);
+        const same =
+          (prevUntil === null && until === null) ||
+          (prevUntil !== null && until !== null && prevUntil === until);
+
+        if (same) continue;
+
+        g.mutes[jid] = { until };
+        updated += 1;
+      }
+
+      if (added > 0 || updated > 0) await flush();
+      return { added, updated, total: Object.keys(g.mutes).length };
+    });
+
+  const removeMutes = (groupJid, userJids) =>
+    enqueue(async () => {
+      const g = ensureGroup(data, groupJid);
+      if (!g) return { removed: 0, total: 0 };
+
+      const incoming = uniq(
+        (Array.isArray(userJids) ? userJids : []).map(normalizeUserJid).filter(Boolean)
+      );
+
+      let removed = 0;
+
+      if (!g.mutes || typeof g.mutes !== 'object' || Array.isArray(g.mutes)) g.mutes = {};
+
+      for (const jid of incoming) {
+        if (!Object.prototype.hasOwnProperty.call(g.mutes, jid)) continue;
+        delete g.mutes[jid];
+        removed += 1;
+      }
+
+      if (removed > 0) await flush();
+      return { removed, total: Object.keys(g.mutes).length };
     });
 
   const getModeration = (groupJid) => {
@@ -296,6 +423,9 @@ export async function createStore({ filePath, logger } = {}) {
     isBanned,
     addBans,
     removeBans,
+    getMute,
+    addMutes,
+    removeMutes,
     getModeration,
     setAntiLink,
     setFilterEnabled,
