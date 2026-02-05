@@ -23,6 +23,27 @@ async function runGroupAction({ socket, groupJid, action, targets }) {
 }
 
 export function createAdminCommands({ logger, sanitizeTargets, getAdminStatus }) {
+  const resolveTargets = async (ctx, example) => {
+    let targets;
+
+    try {
+      targets = await sanitizeTargets(ctx.socket, ctx.targetJids);
+    } catch (err) {
+      logger.warn('فشل تجهيز الأهداف', { group: ctx.groupJid, err: String(err) });
+      await ctx.reply('حدث خطأ أثناء تجهيز الأهداف.');
+      return null;
+    }
+
+    if (!Array.isArray(targets) || targets.length === 0) {
+      await ctx.reply(
+        `لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${example}`
+      );
+      return null;
+    }
+
+    return targets;
+  };
+
   const kick = {
     name: 'kick',
     aliases: [],
@@ -31,12 +52,8 @@ export function createAdminCommands({ logger, sanitizeTargets, getAdminStatus })
     groupOnly: true,
     requiresBotAdmin: true,
     handler: async (ctx) => {
-      const targets = sanitizeTargets(ctx.socket, ctx.targetJids);
-
-      if (targets.length === 0) {
-        await ctx.reply(`لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}kick @شخص`);
-        return;
-      }
+      const targets = await resolveTargets(ctx, `${ctx.prefix}kick @شخص`);
+      if (!targets) return;
 
       const res = await runGroupAction({
         socket: ctx.socket,
@@ -68,12 +85,8 @@ export function createAdminCommands({ logger, sanitizeTargets, getAdminStatus })
     groupOnly: true,
     requiresBotAdmin: true,
     handler: async (ctx) => {
-      const targets = sanitizeTargets(ctx.socket, ctx.targetJids);
-
-      if (targets.length === 0) {
-        await ctx.reply(`لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}ban @شخص`);
-        return;
-      }
+      const targets = await resolveTargets(ctx, `${ctx.prefix}ban @شخص`);
+      if (!targets) return;
 
       const res = await runGroupAction({
         socket: ctx.socket,
@@ -134,12 +147,8 @@ export function createAdminCommands({ logger, sanitizeTargets, getAdminStatus })
     privileged: true,
     groupOnly: true,
     handler: async (ctx) => {
-      const targets = sanitizeTargets(ctx.socket, ctx.targetJids);
-
-      if (targets.length === 0) {
-        await ctx.reply(`لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}unban @شخص`);
-        return;
-      }
+      const targets = await resolveTargets(ctx, `${ctx.prefix}unban @شخص`);
+      if (!targets) return;
 
       let result;
       try {
@@ -165,14 +174,8 @@ export function createAdminCommands({ logger, sanitizeTargets, getAdminStatus })
     privileged: true,
     groupOnly: true,
     handler: async (ctx) => {
-      const targets = sanitizeTargets(ctx.socket, ctx.targetJids);
-
-      if (targets.length === 0) {
-        await ctx.reply(
-          `لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}mute @شخص 10m`
-        );
-        return;
-      }
+      const targets = await resolveTargets(ctx, `${ctx.prefix}mute @شخص 10m`);
+      if (!targets) return;
 
       let duration = null;
       for (const a of Array.isArray(ctx.args) ? ctx.args : []) {
@@ -231,14 +234,8 @@ export function createAdminCommands({ logger, sanitizeTargets, getAdminStatus })
     privileged: true,
     groupOnly: true,
     handler: async (ctx) => {
-      const targets = sanitizeTargets(ctx.socket, ctx.targetJids);
-
-      if (targets.length === 0) {
-        await ctx.reply(
-          `لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}unmute @شخص`
-        );
-        return;
-      }
+      const targets = await resolveTargets(ctx, `${ctx.prefix}unmute @شخص`);
+      if (!targets) return;
 
       let res;
       try {
@@ -266,14 +263,8 @@ export function createAdminCommands({ logger, sanitizeTargets, getAdminStatus })
     groupOnly: true,
     requiresBotAdmin: true,
     handler: async (ctx) => {
-      const targets = sanitizeTargets(ctx.socket, ctx.targetJids);
-
-      if (targets.length === 0) {
-        await ctx.reply(
-          `لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}promote @شخص`
-        );
-        return;
-      }
+      const targets = await resolveTargets(ctx, `${ctx.prefix}promote @شخص`);
+      if (!targets) return;
 
       const res = await runGroupAction({
         socket: ctx.socket,
@@ -305,14 +296,8 @@ export function createAdminCommands({ logger, sanitizeTargets, getAdminStatus })
     groupOnly: true,
     requiresBotAdmin: true,
     handler: async (ctx) => {
-      const targets = sanitizeTargets(ctx.socket, ctx.targetJids);
-
-      if (targets.length === 0) {
-        await ctx.reply(
-          `لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${ctx.prefix}demote @شخص`
-        );
-        return;
-      }
+      const targets = await resolveTargets(ctx, `${ctx.prefix}demote @شخص`);
+      if (!targets) return;
 
       const res = await runGroupAction({
         socket: ctx.socket,
