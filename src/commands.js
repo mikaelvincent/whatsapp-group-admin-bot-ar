@@ -1,3 +1,5 @@
+import { randomInt } from 'node:crypto';
+
 function isGroupJid(jid) {
   return typeof jid === 'string' && jid.endsWith('@g.us');
 }
@@ -279,6 +281,192 @@ async function safeSendText(socket, jid, text, quoted, extra) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const FUN_QUOTES_AR = [
+  'التركيز على خطوة واحدة أفضل من تشتيت ألف خطوة.',
+  'الهدوء لا يعني الضعف؛ أحيانًا يعني الحكمة.',
+  'اترك أثرًا جميلًا حتى في أبسط الكلمات.',
+  'من جدّ وجد، ومن زرع حصد.',
+  'التقدم البسيط كل يوم يصنع فرقًا كبيرًا.',
+  'الاحترام لا يُطلب، يُمارس.',
+  'حافظ على نيتك نظيفة… والباقي يتيسر.',
+  'الكلمة الطيبة صدقة.',
+  'تعلّم أن تقول: لا… عندما يلزم.',
+  'لا تقارن بدايتك بنهاية غيرك.',
+  'الوقت أثمن مما تتوقع.',
+  'خفف توقعاتك… تزداد طاقتك.',
+  'الابتسامة طريقة بسيطة لتخفيف التوتر.',
+  'اجعل يومك أبسط… ليصير أجمل.',
+  'اسأل أكثر… وافترض أقل.',
+  'النجاح يحب الانضباط.',
+  'الراحة ليست كسلًا؛ هي جزء من الاستمرار.',
+  'لا تتجاهل التفاصيل الصغيرة.',
+  'ابدأ الآن… وعدّل لاحقًا.',
+  'الفكرة الجيدة بلا تنفيذ مجرد رغبة.'
+];
+
+const FUN_TODAY_PROMPTS_AR = [
+  '📝 سؤال اليوم: ما عادة بسيطة تتمنى تلتزم بها؟',
+  '🎯 تحدي اليوم: قل كلمة شكر لشخص يستحق.',
+  '🌿 سؤال اليوم: ما شيء واحد يهدّيك بسرعة؟',
+  '📌 تحدي اليوم: اكتب 3 أشياء ممتن لها.',
+  '💡 سؤال اليوم: ما أفضل نصيحة سمعتها مؤخرًا؟',
+  '🧠 تحدي اليوم: تعلّم معلومة صغيرة وشاركها.',
+  '☕ سؤال اليوم: قهوتك/شايك… كيف تفضله؟',
+  '📚 سؤال اليوم: كتاب أو فيلم تنصح به ولماذا؟',
+  '🎵 سؤال اليوم: أغنية ترفع مزاجك دائمًا؟',
+  '🏃 تحدي اليوم: 5 دقائق حركة… أي شيء!',
+  '🗣️ سؤال اليوم: كلمة عربية تحب معناها؟',
+  '🎁 سؤال اليوم: ما أجمل هدية غير مادية تتلقاها؟',
+  '🧩 تحدي اليوم: حلّ لغز بسيط أو لعبة قصيرة.',
+  '🧼 تحدي اليوم: رتّب شيئًا واحدًا حولك الآن.',
+  '🌙 سؤال اليوم: ما أفضل عادة قبل النوم؟'
+];
+
+const FUN_GAME_CATEGORIES_AR = [
+  'مدينة',
+  'دولة',
+  'حيوان',
+  'أكلة',
+  'مهنة',
+  'اسم شخص',
+  'شيء في البيت',
+  'شيء في المدرسة/العمل'
+];
+
+const AR_LETTERS = [
+  'ا',
+  'ب',
+  'ت',
+  'ث',
+  'ج',
+  'ح',
+  'خ',
+  'د',
+  'ذ',
+  'ر',
+  'ز',
+  'س',
+  'ش',
+  'ص',
+  'ض',
+  'ط',
+  'ظ',
+  'ع',
+  'غ',
+  'ف',
+  'ق',
+  'ك',
+  'ل',
+  'م',
+  'ن',
+  'ه',
+  'و',
+  'ي'
+];
+
+function pickRandom(list) {
+  const arr = Array.isArray(list) ? list : [];
+  if (arr.length === 0) return null;
+  return arr[randomInt(0, arr.length)];
+}
+
+function randomInRangeInclusive(min, max) {
+  const a = Number(min);
+  const b = Number(max);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+
+  const lo = Math.min(a, b);
+  const hi = Math.max(a, b);
+
+  if (!Number.isInteger(lo) || !Number.isInteger(hi)) return null;
+  if (lo < 1 || hi < 1) return null;
+  if (hi > 1_000_000) return null;
+
+  return randomInt(lo, hi + 1);
+}
+
+function parseRollSpec(args) {
+  const tokens = (Array.isArray(args) ? args : [])
+    .map((v) => String(v ?? '').trim())
+    .filter(Boolean);
+
+  if (tokens.length === 0) return { kind: 'range', min: 1, max: 6 };
+
+  const a0 = tokens[0].toLowerCase();
+
+  const dice = a0.match(/^(\d{1,2})d(\d{1,4})$/i);
+  if (dice) {
+    const rolls = Number.parseInt(dice[1], 10);
+    const sides = Number.parseInt(dice[2], 10);
+    if (!Number.isFinite(rolls) || !Number.isFinite(sides)) return null;
+    if (rolls < 1 || rolls > 20) return null;
+    if (sides < 2 || sides > 1000) return null;
+    return { kind: 'dice', rolls, sides };
+  }
+
+  const dOnly = a0.match(/^d(\d{1,4})$/i);
+  if (dOnly) {
+    const sides = Number.parseInt(dOnly[1], 10);
+    if (!Number.isFinite(sides) || sides < 2 || sides > 1000) return null;
+    return { kind: 'dice', rolls: 1, sides };
+  }
+
+  const hyphen = a0.match(/^(\d{1,6})-(\d{1,6})$/);
+  if (hyphen) {
+    const min = Number.parseInt(hyphen[1], 10);
+    const max = Number.parseInt(hyphen[2], 10);
+    if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
+    if (min < 1 || max < 1) return null;
+    if (min > 1_000_000 || max > 1_000_000) return null;
+    return { kind: 'range', min, max };
+  }
+
+  const n0 = tokens[0].match(/^\d{1,6}$/);
+  const n1 = tokens[1]?.match(/^\d{1,6}$/);
+
+  if (n0 && n1) {
+    const min = Number.parseInt(tokens[0], 10);
+    const max = Number.parseInt(tokens[1], 10);
+    if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
+    if (min < 1 || max < 1) return null;
+    if (min > 1_000_000 || max > 1_000_000) return null;
+    return { kind: 'range', min, max };
+  }
+
+  if (n0 && tokens.length === 1) {
+    const max = Number.parseInt(tokens[0], 10);
+    if (!Number.isFinite(max)) return null;
+    if (max < 2 || max > 1_000_000) return null;
+    return { kind: 'range', min: 1, max };
+  }
+
+  return null;
+}
+
+function formatUptimeAr(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds ?? 0) || 0));
+  const days = Math.floor(total / 86_400);
+  const rem = total % 86_400;
+
+  const h = Math.floor(rem / 3600);
+  const m = Math.floor((rem % 3600) / 60);
+  const s = rem % 60;
+
+  const hh = String(h).padStart(2, '0');
+  const mm = String(m).padStart(2, '0');
+  const ss = String(s).padStart(2, '0');
+
+  const clock = `${hh}:${mm}:${ss}`;
+  if (days > 0) return `${days} يوم ${clock}`;
+  return clock;
+}
+
+function formatMb(bytes) {
+  const n = Number(bytes);
+  if (!Number.isFinite(n) || n <= 0) return '0 MB';
+  return `${Math.round(n / 1024 / 1024)} MB`;
+}
+
 export function createCommandRouter({ config, logger, store }) {
   const allowlist = new Set(
     (Array.isArray(config.allowlist) ? config.allowlist : [])
@@ -290,7 +478,12 @@ export function createCommandRouter({ config, logger, store }) {
     ? config.moderationWarnCooldownMs
     : 15_000;
 
+  const commandCooldownMs = Number.isFinite(config.commandCooldownMs) ? config.commandCooldownMs : 1200;
+
+  const funCooldownMs = Number.isFinite(config.funCooldownMs) ? config.funCooldownMs : 6000;
+
   const warnCache = new Map();
+  const commandCooldownCache = new Map();
 
   const groupMetaCache = new Map();
   const groupMetaTtlMs = 30_000;
@@ -406,6 +599,28 @@ export function createCommandRouter({ config, logger, store }) {
     return true;
   };
 
+  const cooldownRemainingMs = (key, windowMs, now) => {
+    if (!windowMs || windowMs <= 0) return 0;
+
+    const last = commandCooldownCache.get(key);
+    if (typeof last !== 'number') return 0;
+
+    const delta = now - last;
+    if (delta >= windowMs) return 0;
+
+    return windowMs - delta;
+  };
+
+  const bumpCooldown = (key, now) => {
+    commandCooldownCache.set(key, now);
+    if (commandCooldownCache.size > 20_000) commandCooldownCache.clear();
+  };
+
+  const cooldownWaitAr = (ms) => {
+    const sec = Math.max(1, Math.ceil(Number(ms || 0) / 1000));
+    return `${sec} ثانية`;
+  };
+
   const onOffAr = (v) => (v ? 'مفعل ✅' : 'معطل ❌');
 
   const renderMenuRoot = ({ isAllowlisted }) => {
@@ -471,8 +686,12 @@ export function createCommandRouter({ config, logger, store }) {
     lines.push(`- منع الصور: ${onOffAr(m.antiImage)} (${config.prefix}antiimage on|off)`);
     lines.push(`- منع الملصقات: ${onOffAr(m.antiSticker)} (${config.prefix}antisticker on|off)`);
     lines.push('');
-    lines.push(`- استثناء المخولين: ${onOffAr(m.exemptAllowlisted)} (${config.prefix}exempt allowlist on|off)`);
-    lines.push(`- استثناء مشرفي المجموعة: ${onOffAr(m.exemptAdmins)} (${config.prefix}exempt admins on|off)`);
+    lines.push(
+      `- استثناء المخولين: ${onOffAr(m.exemptAllowlisted)} (${config.prefix}exempt allowlist on|off)`
+    );
+    lines.push(
+      `- استثناء مشرفي المجموعة: ${onOffAr(m.exemptAdmins)} (${config.prefix}exempt admins on|off)`
+    );
     if (w) lines.push(`- الترحيب: ${onOffAr(Boolean(w.enabled))} (${config.prefix}welcome on|off)`);
     lines.push('');
     lines.push(`- عرض القواعد: ${config.prefix}rules`);
@@ -487,6 +706,11 @@ export function createCommandRouter({ config, logger, store }) {
     lines.push('🎲 قسم الفعاليات');
     lines.push('');
     lines.push(`- ${config.prefix}ping : فحص سريع`);
+    lines.push(`- ${config.prefix}dice [نطاق] : رمية عشوائية`);
+    lines.push(`- ${config.prefix}quote : اقتباس عشوائي`);
+    lines.push(`- ${config.prefix}today : سؤال/تحدي اليوم`);
+    lines.push(`- ${config.prefix}game : فعالية سريعة`);
+    lines.push(`- ${config.prefix}uptime : حالة التشغيل`);
     lines.push(`- ${config.prefix}auth : حالة صلاحيتك`);
     lines.push(`- ${config.prefix}targets : طريقة تحديد الهدف`);
     lines.push(`- ${config.prefix}help : جميع الأوامر`);
@@ -770,7 +994,12 @@ export function createCommandRouter({ config, logger, store }) {
     try {
       await safeSendText(socket, groupJid, warningText, null, { mentions });
     } catch (err) {
-      logger.warn('فشل إرسال تحذير إشراف', { group: groupJid, from: senderJid, rule, err: String(err) });
+      logger.warn('فشل إرسال تحذير إشراف', {
+        group: groupJid,
+        from: senderJid,
+        rule,
+        err: String(err)
+      });
     }
   };
 
@@ -1240,6 +1469,107 @@ export function createCommandRouter({ config, logger, store }) {
       }
     },
     {
+      name: 'dice',
+      aliases: ['roll'],
+      category: 'fun',
+      privileged: false,
+      groupOnly: true,
+      handler: async (ctx) => {
+        const spec = parseRollSpec(ctx.args);
+
+        const usage =
+          `الاستخدام:\n` +
+          `- ${ctx.prefix}dice (افتراضي 1-6)\n` +
+          `- ${ctx.prefix}dice 100 (1-100)\n` +
+          `- ${ctx.prefix}dice 5-20\n` +
+          `- ${ctx.prefix}dice 2d6`;
+
+        if (!spec) {
+          await ctx.reply(usage);
+          return;
+        }
+
+        if (spec.kind === 'dice') {
+          const results = [];
+          let sum = 0;
+
+          for (let i = 0; i < spec.rolls; i += 1) {
+            const v = randomInt(1, spec.sides + 1);
+            results.push(v);
+            sum += v;
+          }
+
+          const lines = [];
+          lines.push(`🎲 ${spec.rolls}d${spec.sides}`);
+          lines.push(`النتائج: ${results.join(', ')}`);
+          if (spec.rolls > 1) lines.push(`المجموع: ${sum}`);
+
+          await ctx.reply(lines.join('\n'));
+          return;
+        }
+
+        const value = randomInRangeInclusive(spec.min, spec.max);
+        if (value === null) {
+          await ctx.reply(usage);
+          return;
+        }
+
+        await ctx.reply(`🎲 النتيجة: ${value} (${spec.min}-${spec.max})`);
+      }
+    },
+    {
+      name: 'quote',
+      aliases: [],
+      category: 'fun',
+      privileged: false,
+      groupOnly: true,
+      handler: async (ctx) => {
+        const q = pickRandom(FUN_QUOTES_AR) || 'ابتسم 🙂';
+        await ctx.reply(`💬 ${q}`);
+      }
+    },
+    {
+      name: 'today',
+      aliases: ['daily'],
+      category: 'fun',
+      privileged: false,
+      groupOnly: true,
+      handler: async (ctx) => {
+        const prompt = pickRandom(FUN_TODAY_PROMPTS_AR) || '📝 سؤال اليوم: كيف كان يومك؟';
+        await ctx.reply(prompt);
+      }
+    },
+    {
+      name: 'game',
+      aliases: ['event'],
+      category: 'fun',
+      privileged: false,
+      groupOnly: true,
+      handler: async (ctx) => {
+        const letter = pickRandom(AR_LETTERS) || 'م';
+        const category = pickRandom(FUN_GAME_CATEGORIES_AR) || 'مدينة';
+        await ctx.reply(`🎮 لعبة سريعة: اكتب ${category} يبدأ بحرف: (${letter})\n⏱️ 30 ثانية!`);
+      }
+    },
+    {
+      name: 'uptime',
+      aliases: [],
+      category: 'fun',
+      privileged: false,
+      groupOnly: true,
+      handler: async (ctx) => {
+        const mem = process.memoryUsage ? process.memoryUsage() : null;
+        const rss = mem?.rss ?? 0;
+
+        const lines = [];
+        lines.push('📊 حالة البوت');
+        lines.push(`- مدة التشغيل: ${formatUptimeAr(process.uptime())}`);
+        lines.push(`- الذاكرة (RSS): ${formatMb(rss)}`);
+
+        await ctx.reply(lines.join('\n'));
+      }
+    },
+    {
       name: 'kick',
       aliases: [],
       category: 'admin',
@@ -1266,7 +1596,9 @@ export function createCommandRouter({ config, logger, store }) {
         if (res.failed.length > 0) {
           const failedList = formatJids(res.failed.map((f) => f.jid));
           lines.push(
-            `⚠️ تعذر إخراج ${res.failed.length} عضو/أعضاء.${failedList ? `\nالذين تعذر إخراجهم: ${failedList}` : ''}`
+            `⚠️ تعذر إخراج ${res.failed.length} عضو/أعضاء.${
+              failedList ? `\nالذين تعذر إخراجهم: ${failedList}` : ''
+            }`
           );
         }
 
@@ -1325,7 +1657,9 @@ export function createCommandRouter({ config, logger, store }) {
         if (res.failed.length > 0) {
           const failedList = formatJids(res.failed.map((f) => f.jid));
           lines.push(
-            `⚠️ تعذر إخراج ${res.failed.length} عضو/أعضاء.${failedList ? `\nالذين تعذر إخراجهم: ${failedList}` : ''}`
+            `⚠️ تعذر إخراج ${res.failed.length} عضو/أعضاء.${
+              failedList ? `\nالذين تعذر إخراجهم: ${failedList}` : ''
+            }`
           );
         }
 
@@ -1494,7 +1828,9 @@ export function createCommandRouter({ config, logger, store }) {
         if (res.failed.length > 0) {
           const failedList = formatJids(res.failed.map((f) => f.jid));
           lines.push(
-            `⚠️ تعذر ترقية ${res.failed.length} عضو/أعضاء.${failedList ? `\nالذين تعذر ترقيتهم: ${failedList}` : ''}`
+            `⚠️ تعذر ترقية ${res.failed.length} عضو/أعضاء.${
+              failedList ? `\nالذين تعذر ترقيتهم: ${failedList}` : ''
+            }`
           );
         }
 
@@ -1530,7 +1866,9 @@ export function createCommandRouter({ config, logger, store }) {
         if (res.failed.length > 0) {
           const failedList = formatJids(res.failed.map((f) => f.jid));
           lines.push(
-            `⚠️ تعذر تنزيل ${res.failed.length} عضو/أعضاء.${failedList ? `\nالذين تعذر تنزيلهم: ${failedList}` : ''}`
+            `⚠️ تعذر تنزيل ${res.failed.length} عضو/أعضاء.${
+              failedList ? `\nالذين تعذر تنزيلهم: ${failedList}` : ''
+            }`
           );
         }
 
@@ -1757,6 +2095,55 @@ export function createCommandRouter({ config, logger, store }) {
           return;
         }
       }
+    }
+
+    if (senderJid && isGroupJid(chatJid)) {
+      const now = Date.now();
+      const baseKey = `${chatJid}|${senderJid}|cmd`;
+      const funKey = `${chatJid}|${senderJid}|fun`;
+
+      const baseWait = cooldownRemainingMs(baseKey, commandCooldownMs, now);
+      if (baseWait > 0) {
+        logger.warn('رفض أمر بسبب تهدئة', {
+          command: def.name,
+          group: chatJid,
+          from: senderJid,
+          wait_ms: baseWait,
+          scope: 'cmd'
+        });
+
+        await safeSendText(
+          socket,
+          chatJid,
+          `⏳ انتظر ${cooldownWaitAr(baseWait)} قبل إعادة استخدام الأوامر.`,
+          msg
+        );
+        return;
+      }
+
+      if (def.category === 'fun') {
+        const funWait = cooldownRemainingMs(funKey, funCooldownMs, now);
+        if (funWait > 0) {
+          logger.warn('رفض أمر بسبب تهدئة', {
+            command: def.name,
+            group: chatJid,
+            from: senderJid,
+            wait_ms: funWait,
+            scope: 'fun'
+          });
+
+          await safeSendText(
+            socket,
+            chatJid,
+            `⏳ انتظر ${cooldownWaitAr(funWait)} قبل استخدام أوامر الفعاليات مرة أخرى.`,
+            msg
+          );
+          return;
+        }
+      }
+
+      if (commandCooldownMs > 0) bumpCooldown(baseKey, now);
+      if (def.category === 'fun' && funCooldownMs > 0) bumpCooldown(funKey, now);
     }
 
     const resolution = resolveTargetsFromMessage(msg.message, parsed.args);
