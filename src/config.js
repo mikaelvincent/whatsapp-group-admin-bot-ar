@@ -74,6 +74,7 @@ function parseAllowlist(value) {
 export function loadConfig() {
   const prefix = normalizePrefix(readEnv('BOT_PREFIX', '!'));
   const authDir = path.resolve(process.cwd(), readEnv('BOT_AUTH_DIR', './data/auth'));
+  const storagePath = path.resolve(process.cwd(), readEnv('BOT_STORAGE_PATH', './data/store.json'));
   const logLevel = parseLogLevel(readEnv('BOT_LOG_LEVEL', 'info'), 'info');
   const baileysLogLevel = parseLogLevel(readEnv('BAILEYS_LOG_LEVEL', 'warn'), 'warn');
   const pingResponse = readEnv('BOT_PING_RESPONSE', '🏓 بونج! البوت يعمل ✅');
@@ -84,6 +85,7 @@ export function loadConfig() {
   return {
     prefix,
     authDir,
+    storagePath,
     logLevel,
     baileysLogLevel,
     pingResponse,
