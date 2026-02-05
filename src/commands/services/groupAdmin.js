@@ -1,5 +1,23 @@
 import { isUserJid, normalizeUserJid } from '../utils/jid.js';
 
+function isPnUserJid(jid) {
+  return typeof jid === 'string' && jid.endsWith('@s.whatsapp.net');
+}
+
+async function maybeToLid(socket, userJid) {
+  if (!isPnUserJid(userJid)) return userJid;
+
+  const mapping = socket?.signalRepository?.lidMapping;
+  if (!mapping || typeof mapping.getLIDForPN !== 'function') return userJid;
+
+  try {
+    const lid = await mapping.getLIDForPN(userJid);
+    return normalizeUserJid(lid) || userJid;
+  } catch {
+    return userJid;
+  }
+}
+
 export function createGroupAdminService({ logger, ttlMs = 30_000 } = {}) {
   const groupMetaCache = new Map();
 
@@ -23,9 +41,10 @@ export function createGroupAdminService({ logger, ttlMs = 30_000 } = {}) {
       if (!Array.isArray(parts)) return { ok: true, isAdmin: false };
 
       const normalized = normalizeUserJid(userJid);
+      if (!normalized) return { ok: true, isAdmin: false };
 
       for (const p of parts) {
-        const pid = normalizeUserJid(p?.id || p?.jid || p?.participant || null);
+        const pid = normalizeUserJid(p?.id || null);
         if (!pid) continue;
         if (pid !== normalized) continue;
         return { ok: true, isAdmin: Boolean(p?.admin) };
@@ -38,18 +57,20 @@ export function createGroupAdminService({ logger, ttlMs = 30_000 } = {}) {
     }
   };
 
-  const getBotJid = (socket) => {
-    const raw = socket?.user?.id || socket?.user?.jid || null;
-    return normalizeUserJid(raw || null);
-  };
+  const getBotJid = (socket) => normalizeUserJid(socket?.user?.id || null);
 
-  const sanitizeTargets = (socket, targets) => {
+  const sanitizeTargets = async (socket, targets) => {
     const botJid = getBotJid(socket);
     const unique = Array.from(
       new Set((Array.isArray(targets) ? targets : []).map(normalizeUserJid).filter(Boolean))
-    );
+    ).filter((jid) => isUserJid(jid) && (!botJid || jid !== botJid));
 
-    return unique.filter((jid) => isUserJid(jid) && (!botJid || jid !== botJid));
+    const resolved = [];
+    for (const jid of unique) {
+      resolved.push(await maybeToLid(socket, jid));
+    }
+
+    return Array.from(new Set(resolved.map(normalizeUserJid).filter(Boolean)));
   };
 
   return {
