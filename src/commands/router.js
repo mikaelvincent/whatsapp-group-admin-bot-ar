@@ -146,7 +146,13 @@ export function createCommandRouter({ config, logger, store }) {
     const senderRawJid = isGroup ? msg.key?.participant : msg.key?.remoteJid;
     const senderJid = normalizeUserJid(senderRawJid);
 
-    const isAllowlisted = Boolean(senderJid && allowlist.has(senderJid));
+    const senderAltRawJid = isGroup ? msg.key?.participantAlt : msg.key?.remoteJidAlt;
+    const senderAltJid = normalizeUserJid(senderAltRawJid);
+
+    const isAllowlisted = Boolean(
+      (senderJid && allowlist.has(senderJid)) || (senderAltJid && allowlist.has(senderAltJid))
+    );
+
     const botJid = groupAdmin.getBotJid(socket);
 
     if (isGroup && senderJid) {
