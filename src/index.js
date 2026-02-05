@@ -8,7 +8,9 @@ async function main() {
 
   logger.info('بدء تشغيل البوت', {
     prefix: config.prefix,
-    auth_dir: config.authDir
+    auth_dir: config.authDir,
+    allowlist_count: Array.isArray(config.allowlist) ? config.allowlist.length : 0,
+    require_caller_admin: Boolean(config.requireCallerAdmin)
   });
 
   const bot = await startWhatsAppBot({
