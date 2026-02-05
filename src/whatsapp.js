@@ -1,54 +1,14 @@
-import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import makeWASocket, {
-  DisconnectReason,
-  fetchLatestWaWebVersion,
-  makeCacheableSignalKeyStore,
-  useMultiFileAuthState
-} from '@whiskeysockets/baileys';
+import makeWASocket, { DisconnectReason, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 
 import { createCommandRouter } from './commands.js';
+import { useSingleFileAuthState } from './baileysAuth.js';
+import { safeSendText, sleep } from './commands/utils/send.js';
+import { isGroupJid, jidMentionTag, normalizeUserJid } from './commands/utils/jid.js';
 import { createStore } from './storage.js';
-
-function isGroupJid(jid) {
-  return typeof jid === 'string' && jid.endsWith('@g.us');
-}
-
-function normalizeUserJid(jid) {
-  if (typeof jid !== 'string') return null;
-  const trimmed = jid.trim();
-  if (!trimmed) return null;
-
-  const at = trimmed.indexOf('@');
-  if (at === -1) return null;
-
-  const userPart = trimmed.slice(0, at);
-  const serverPart = trimmed.slice(at + 1).toLowerCase();
-  const user = userPart.split(':')[0];
-
-  if (!user || !serverPart) return null;
-  return `${user}@${serverPart}`;
-}
-
-function jidMentionTag(jid) {
-  const u = normalizeUserJid(jid);
-  const id = u ? u.split('@')[0] : '';
-  return id ? `@${id}` : '';
-}
-
-async function safeSendText(socket, jid, text, extra) {
-  if (!jid) return;
-
-  const message = { text: String(text ?? '') };
-  if (extra?.mentions && Array.isArray(extra.mentions) && extra.mentions.length > 0) {
-    message.mentions = extra.mentions;
-  }
-
-  await socket.sendMessage(jid, message);
-}
 
 function renderRulesSummaryForWelcome(store, groupJid) {
   const m = store.getModeration(groupJid);
@@ -82,49 +42,6 @@ function renderWelcomeText(template, params) {
   return out;
 }
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-async function ensureSecureDir(dirPath) {
-  await fs.mkdir(dirPath, { recursive: true, mode: 0o700 });
-  try {
-    await fs.chmod(dirPath, 0o700);
-  } catch {}
-}
-
-async function secureTree(rootPath) {
-  const visit = async (p) => {
-    let entries;
-    try {
-      entries = await fs.readdir(p, { withFileTypes: true });
-    } catch {
-      return;
-    }
-
-    await Promise.all(
-      entries.map(async (ent) => {
-        const full = path.join(p, ent.name);
-        if (ent.isDirectory()) {
-          try {
-            await fs.chmod(full, 0o700);
-          } catch {}
-          await visit(full);
-          return;
-        }
-
-        try {
-          await fs.chmod(full, 0o600);
-        } catch {}
-      })
-    );
-  };
-
-  try {
-    await fs.chmod(rootPath, 0o700);
-  } catch {}
-
-  await visit(rootPath);
-}
-
 function computeBackoff(attempt) {
   const base = 2000;
   const max = 60000;
@@ -133,16 +50,16 @@ function computeBackoff(attempt) {
   return Math.min(max, delay + jitter);
 }
 
-function disconnectCode(lastDisconnect) {
-  const err = lastDisconnect?.error;
-  const outputCode = err?.output?.statusCode;
-  const directCode = err?.statusCode;
-  const reason = outputCode ?? directCode;
-  return typeof reason === 'number' ? reason : null;
+function getDisconnectStatusCode(lastDisconnect) {
+  const code = lastDisconnect?.error?.output?.statusCode;
+  return typeof code === 'number' ? code : null;
 }
 
-function shouldRefreshWaWebVersion(code) {
-  return code === 405 || code === DisconnectReason.unavailableService;
+function messageKeyToId(key) {
+  const jid = String(key?.remoteJid ?? '').trim();
+  const id = String(key?.id ?? '').trim();
+  if (!jid || !id) return null;
+  return `${jid}|${id}`;
 }
 
 export async function startWhatsAppBot({ config, logger }) {
@@ -178,29 +95,79 @@ export async function startWhatsAppBot({ config, logger }) {
     store
   });
 
-  const groupMetaCache = new Map();
-  const groupMetaTtlMs = 30_000;
+  const auth = await useSingleFileAuthState({
+    filePath: path.join(config.authDir, 'auth-state.json')
+  });
 
-  const getGroupSubject = async (socketRef, groupJid) => {
-    const now = Date.now();
-    const cached = groupMetaCache.get(groupJid);
+  const messageCache = new Map();
+  const messageCacheTtlMs = 10 * 60 * 1000;
+  const messageCacheMax = 5000;
 
-    if (cached && now - cached.ts < groupMetaTtlMs) return cached.subject;
+  const rememberMessage = (msg) => {
+    const key = msg?.key;
+    const m = msg?.message;
+    const k = messageKeyToId(key);
+    if (!k || !m) return;
 
-    try {
-      const meta = await socketRef.groupMetadata(groupJid);
-      const subject = String(meta?.subject ?? '').trim();
-      groupMetaCache.set(groupJid, { ts: now, subject });
-      return subject;
-    } catch (err) {
-      groupMetaCache.set(groupJid, { ts: now, subject: '' });
-      return '';
+    messageCache.set(k, { ts: Date.now(), message: m });
+
+    while (messageCache.size > messageCacheMax) {
+      const first = messageCache.keys().next().value;
+      if (!first) break;
+      messageCache.delete(first);
     }
   };
 
-  let waWebVersion = null;
-  let waWebVersionRefreshRequested = false;
-  let waWebVersionFetchBlockedUntilMs = 0;
+  const getMessage = async (key) => {
+    const k = messageKeyToId(key);
+    if (!k) return undefined;
+
+    const entry = messageCache.get(k);
+    if (!entry) return undefined;
+
+    const now = Date.now();
+    if (now - entry.ts > messageCacheTtlMs) {
+      messageCache.delete(k);
+      return undefined;
+    }
+
+    return entry.message;
+  };
+
+  const groupMetaCache = new Map();
+  const groupMetaTtlMs = 30_000;
+
+  const getCachedGroupMetadata = (groupJid) => {
+    const v = groupMetaCache.get(groupJid);
+    if (!v) return null;
+
+    if (Date.now() - v.ts > groupMetaTtlMs) {
+      groupMetaCache.delete(groupJid);
+      return null;
+    }
+
+    return v.data || null;
+  };
+
+  const cachedGroupMetadata = async (jid) => getCachedGroupMetadata(jid) || undefined;
+
+  const getGroupMetadata = async (socketRef, groupJid) => {
+    const cached = getCachedGroupMetadata(groupJid);
+    if (cached) return cached;
+
+    const meta = await socketRef.groupMetadata(groupJid);
+    groupMetaCache.set(groupJid, { ts: Date.now(), data: meta });
+    return meta;
+  };
+
+  const getGroupSubject = async (socketRef, groupJid) => {
+    try {
+      const meta = await getGroupMetadata(socketRef, groupJid);
+      return String(meta?.subject ?? '').trim();
+    } catch {
+      return '';
+    }
+  };
 
   const clearReconnectTimer = () => {
     if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -209,6 +176,7 @@ export async function startWhatsAppBot({ config, logger }) {
 
   const stopSocket = async () => {
     if (!socket) return;
+
     try {
       socket.ev.removeAllListeners('connection.update');
       socket.ev.removeAllListeners('creds.update');
@@ -217,42 +185,10 @@ export async function startWhatsAppBot({ config, logger }) {
     } catch {}
 
     try {
-      socket.ws.close();
+      socket.end();
     } catch {}
+
     socket = null;
-  };
-
-  const requestWaWebVersionRefresh = (code) => {
-    if (!shouldRefreshWaWebVersion(code)) return;
-    waWebVersion = null;
-    waWebVersionRefreshRequested = true;
-  };
-
-  const maybeFetchWaWebVersion = async () => {
-    if (!waWebVersionRefreshRequested) return;
-    const now = Date.now();
-    if (now < waWebVersionFetchBlockedUntilMs) return;
-
-    try {
-      const res = await fetchLatestWaWebVersion({});
-      if (res?.error) throw res.error;
-      if (!Array.isArray(res?.version) || res.version.length < 3)
-        throw new Error('invalid_wa_web_version');
-
-      waWebVersion = res.version;
-      waWebVersionRefreshRequested = false;
-
-      logger.info('تم تحديث نسخة واتساب ويب', {
-        version: res.version.join('.'),
-        is_latest: Boolean(res.isLatest)
-      });
-    } catch (err) {
-      waWebVersionFetchBlockedUntilMs = now + 60000;
-      logger.warn('فشل تحديث نسخة واتساب ويب', {
-        err: String(err),
-        retry_after_ms: 60000
-      });
-    }
   };
 
   const scheduleReconnect = async (reason) => {
@@ -261,6 +197,7 @@ export async function startWhatsAppBot({ config, logger }) {
 
     const delay = computeBackoff(reconnectAttempt);
     logger.warn('إعادة الاتصال قريبًا', { delay_ms: delay, reason });
+
     reconnectTimer = setTimeout(() => {
       reconnectAttempt += 1;
       void startSocket();
@@ -274,33 +211,21 @@ export async function startWhatsAppBot({ config, logger }) {
       clearReconnectTimer();
       await stopSocket();
 
-      await ensureSecureDir(config.authDir);
-      await secureTree(config.authDir);
-
-      const { state, saveCreds } = await useMultiFileAuthState(config.authDir);
-
-      await maybeFetchWaWebVersion();
-
-      const socketConfig = {
+      socket = makeWASocket({
         auth: {
-          creds: state.creds,
-          keys: makeCacheableSignalKeyStore(state.keys, baileysLogger)
+          creds: auth.state.creds,
+          keys: makeCacheableSignalKeyStore(auth.state.keys, baileysLogger)
         },
         logger: baileysLogger,
         markOnlineOnConnect: false,
-        syncFullHistory: false
-      };
-
-      if (waWebVersion) {
-        socketConfig.version = waWebVersion;
-      }
-
-      socket = makeWASocket(socketConfig);
+        syncFullHistory: false,
+        getMessage,
+        cachedGroupMetadata
+      });
 
       socket.ev.on('creds.update', async () => {
         try {
-          await saveCreds();
-          await secureTree(config.authDir);
+          await auth.saveCreds();
           logger.info('تم حفظ بيانات المصادقة');
         } catch (err) {
           logger.warn('فشل حفظ بيانات المصادقة', { err: String(err) });
@@ -320,15 +245,16 @@ export async function startWhatsAppBot({ config, logger }) {
         }
 
         if (update.connection === 'close') {
-          const code = disconnectCode(update.lastDisconnect);
-
-          if (code !== null) requestWaWebVersionRefresh(code);
+          const code = getDisconnectStatusCode(update.lastDisconnect);
 
           if (code === DisconnectReason.loggedOut) {
             logger.error('تم تسجيل الخروج: يلزم إعادة ربط الجلسة', { code });
             stopped = true;
             clearReconnectTimer();
             await stopSocket();
+            try {
+              await auth.flush();
+            } catch {}
             process.exitCode = 1;
             return;
           }
@@ -351,7 +277,7 @@ export async function startWhatsAppBot({ config, logger }) {
 
           if (participants.length === 0) return;
 
-          const botJid = normalizeUserJid(socket?.user?.id || socket?.user?.jid || null);
+          const botJid = normalizeUserJid(socket?.user?.id || null);
 
           const banned = [];
           const welcomed = [];
@@ -395,7 +321,8 @@ export async function startWhatsAppBot({ config, logger }) {
                 await safeSendText(
                   socket,
                   groupJid,
-                  `🚫 تم إخراج ${removed.length} عضو/أعضاء محظورين تلقائيًا.`
+                  `🚫 تم إخراج ${removed.length} عضو/أعضاء محظورين تلقائيًا.`,
+                  null
                 );
               } catch (err) {
                 logger.warn('فشل إعلان إخراج محظور', { group: groupJid, err: String(err) });
@@ -407,7 +334,8 @@ export async function startWhatsAppBot({ config, logger }) {
                 await safeSendText(
                   socket,
                   groupJid,
-                  '⚠️ تعذر إخراج عضو/أعضاء محظورين تلقائيًا. تأكد أن البوت مشرف في المجموعة.'
+                  '⚠️ تعذر إخراج عضو/أعضاء محظورين تلقائيًا. تأكد أن البوت مشرف في المجموعة.',
+                  null
                 );
               } catch (err) {
                 logger.warn('فشل إعلان فشل إخراج محظور', { group: groupJid, err: String(err) });
@@ -437,7 +365,7 @@ export async function startWhatsAppBot({ config, logger }) {
             prefix: config.prefix
           });
 
-          await safeSendText(socket, groupJid, text, { mentions: welcomed });
+          await safeSendText(socket, groupJid, text, null, { mentions: welcomed });
 
           logger.info('تم إرسال ترحيب', {
             group: groupJid,
@@ -454,6 +382,7 @@ export async function startWhatsAppBot({ config, logger }) {
 
         for (const msg of messages) {
           try {
+            rememberMessage(msg);
             await commandRouter.handle({ socket, msg });
           } catch (err) {
             logger.warn('فشل التعامل مع رسالة', { err: String(err) });
@@ -473,6 +402,9 @@ export async function startWhatsAppBot({ config, logger }) {
       stopped = true;
       clearReconnectTimer();
       await stopSocket();
+      try {
+        await auth.flush();
+      } catch {}
       await store.close();
     }
   };
