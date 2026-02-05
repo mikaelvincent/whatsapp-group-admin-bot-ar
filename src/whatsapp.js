@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import makeWASocket, {
   DisconnectReason,
+  fetchLatestWaWebVersion,
   makeCacheableSignalKeyStore,
   useMultiFileAuthState
 } from '@whiskeysockets/baileys';
@@ -102,6 +103,10 @@ function disconnectCode(lastDisconnect) {
   return typeof reason === 'number' ? reason : null;
 }
 
+function shouldRefreshWaWebVersion(code) {
+  return code === 405 || code === DisconnectReason.unavailableService;
+}
+
 export async function startWhatsAppBot({ config, logger }) {
   let socket = null;
   let stopped = false;
@@ -109,6 +114,10 @@ export async function startWhatsAppBot({ config, logger }) {
   let reconnectAttempt = 0;
 
   const baileysLogger = pino({ level: config.baileysLogLevel });
+
+  let waWebVersion = null;
+  let waWebVersionRefreshRequested = false;
+  let waWebVersionFetchBlockedUntilMs = 0;
 
   const clearReconnectTimer = () => {
     if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -131,6 +140,40 @@ export async function startWhatsAppBot({ config, logger }) {
       // ignore
     }
     socket = null;
+  };
+
+  const requestWaWebVersionRefresh = (code) => {
+    if (!shouldRefreshWaWebVersion(code)) return;
+    waWebVersion = null;
+    waWebVersionRefreshRequested = true;
+  };
+
+  const maybeFetchWaWebVersion = async () => {
+    if (!waWebVersionRefreshRequested) return;
+    const now = Date.now();
+    if (now < waWebVersionFetchBlockedUntilMs) return;
+
+    // Only override the WA Web version when servers start rejecting the built-in one (405/503),
+    // to reduce the chance of using a too-new version with incompatible protobufs.
+    try {
+      const res = await fetchLatestWaWebVersion({});
+      if (res?.error) throw res.error;
+      if (!Array.isArray(res?.version) || res.version.length < 3) throw new Error('invalid_wa_web_version');
+
+      waWebVersion = res.version;
+      waWebVersionRefreshRequested = false;
+
+      logger.info('تم تحديث نسخة واتساب ويب', {
+        version: res.version.join('.'),
+        is_latest: Boolean(res.isLatest)
+      });
+    } catch (err) {
+      waWebVersionFetchBlockedUntilMs = now + 60000;
+      logger.warn('فشل تحديث نسخة واتساب ويب', {
+        err: String(err),
+        retry_after_ms: 60000
+      });
+    }
   };
 
   const scheduleReconnect = async (reason) => {
@@ -157,7 +200,9 @@ export async function startWhatsAppBot({ config, logger }) {
 
       const { state, saveCreds } = await useMultiFileAuthState(config.authDir);
 
-      socket = makeWASocket({
+      await maybeFetchWaWebVersion();
+
+      const socketConfig = {
         auth: {
           creds: state.creds,
           keys: makeCacheableSignalKeyStore(state.keys, baileysLogger)
@@ -165,7 +210,13 @@ export async function startWhatsAppBot({ config, logger }) {
         logger: baileysLogger,
         markOnlineOnConnect: false,
         syncFullHistory: false
-      });
+      };
+
+      if (waWebVersion) {
+        socketConfig.version = waWebVersion;
+      }
+
+      socket = makeWASocket(socketConfig);
 
       socket.ev.on('creds.update', async () => {
         try {
@@ -191,6 +242,9 @@ export async function startWhatsAppBot({ config, logger }) {
 
         if (update.connection === 'close') {
           const code = disconnectCode(update.lastDisconnect);
+
+          if (code !== null) requestWaWebVersionRefresh(code);
+
           if (code === DisconnectReason.loggedOut) {
             logger.error('تم تسجيل الخروج: يلزم إعادة ربط الجلسة', { code });
             stopped = true;
