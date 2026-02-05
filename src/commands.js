@@ -833,6 +833,84 @@ export function createCommandRouter({ config, logger, store }) {
       }
     },
     {
+      name: 'welcome',
+      aliases: [],
+      category: 'moderation',
+      privileged: true,
+      groupOnly: true,
+      handler: async (ctx) => {
+        const sub = String(ctx.args[0] ?? '')
+          .trim()
+          .toLowerCase();
+
+        const usage =
+          `الاستخدام:\n` +
+          `- ${ctx.prefix}welcome on|off\n` +
+          `- ${ctx.prefix}welcome set <نص>\n` +
+          `المتغيرات: {user} {group} {rules}`;
+
+        if (!sub) {
+          const current = ctx.store.getWelcome(ctx.groupJid);
+          if (!current) {
+            await ctx.reply('تعذر قراءة إعدادات الترحيب لهذه المجموعة.');
+            return;
+          }
+
+          const status = current.enabled ? 'مفعل ✅' : 'معطل ❌';
+          const tpl = String(current.template ?? '').trim();
+          const shown = tpl.length > 900 ? `${tpl.slice(0, 900)}...` : tpl;
+
+          await ctx.reply(`📣 الترحيب: ${status}\n\nالنص الحالي:\n${shown}\n\n${usage}`);
+          return;
+        }
+
+        if (sub === 'on' || sub === 'off') {
+          const enabled = sub === 'on';
+          try {
+            const res = await ctx.store.setWelcomeEnabled(ctx.groupJid, enabled);
+            if (!res?.ok) throw new Error('store_rejected');
+          } catch (err) {
+            logger.warn('فشل تحديث إعدادات الترحيب', { group: ctx.groupJid, err: String(err) });
+            await ctx.reply('حدث خطأ أثناء تحديث إعدادات الترحيب.');
+            return;
+          }
+
+          await ctx.reply(enabled ? '✅ تم تفعيل الترحيب.' : '✅ تم تعطيل الترحيب.');
+          return;
+        }
+
+        if (sub === 'set') {
+          const raw = String(ctx.rawArgs ?? '').trim();
+          const without = raw.replace(/^set\b/i, '').trim();
+          const template = without.replace(/\\n/g, '\n').trim();
+
+          if (!template) {
+            await ctx.reply(`اكتب نص الترحيب بعد الأمر.\nمثال: ${ctx.prefix}welcome set مرحبًا {user}!`);
+            return;
+          }
+
+          if (template.length > 2000) {
+            await ctx.reply('نص الترحيب طويل جدًا. حاول تقصيره.');
+            return;
+          }
+
+          try {
+            const res = await ctx.store.setWelcomeTemplate(ctx.groupJid, template);
+            if (!res?.ok) throw new Error('store_rejected');
+          } catch (err) {
+            logger.warn('فشل تحديث نص الترحيب', { group: ctx.groupJid, err: String(err) });
+            await ctx.reply('حدث خطأ أثناء تحديث نص الترحيب.');
+            return;
+          }
+
+          await ctx.reply('✅ تم تحديث نص الترحيب.');
+          return;
+        }
+
+        await ctx.reply(usage);
+      }
+    },
+    {
       name: 'ping',
       aliases: ['p'],
       category: 'fun',
