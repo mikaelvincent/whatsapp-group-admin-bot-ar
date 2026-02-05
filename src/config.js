@@ -92,6 +92,9 @@ export function loadConfig() {
     15000
   );
 
+  const commandCooldownMs = parsePositiveInt(readEnv('BOT_CMD_COOLDOWN_MS', '1200'), 1200);
+  const funCooldownMs = parsePositiveInt(readEnv('BOT_FUN_COOLDOWN_MS', '6000'), 6000);
+
   return {
     prefix,
     authDir,
@@ -101,6 +104,42 @@ export function loadConfig() {
     pingResponse,
     allowlist,
     requireCallerAdmin,
-    moderationWarnCooldownMs
+    moderationWarnCooldownMs,
+    commandCooldownMs,
+    funCooldownMs
   };
+}
+
+export function validateConfig(config) {
+  const errors = [];
+  const warnings = [];
+
+  const prefix = String(config?.prefix ?? '');
+  if (!prefix.trim()) errors.push('BOT_PREFIX فارغ.');
+  if (/\s/.test(prefix)) errors.push('BOT_PREFIX يحتوي مسافات.');
+  if (prefix.trim().length > 5) warnings.push('BOT_PREFIX طويل وقد يسبب التباسًا.');
+
+  const authDir = String(config?.authDir ?? '').trim();
+  if (!authDir) errors.push('BOT_AUTH_DIR غير صالح.');
+
+  const storagePath = String(config?.storagePath ?? '').trim();
+  if (!storagePath) errors.push('BOT_STORAGE_PATH غير صالح.');
+
+  const cmdCd = config?.commandCooldownMs;
+  if (!Number.isFinite(cmdCd) || cmdCd < 0) errors.push('BOT_CMD_COOLDOWN_MS غير صالح.');
+  if (Number.isFinite(cmdCd) && cmdCd > 120_000) warnings.push('BOT_CMD_COOLDOWN_MS كبير جدًا.');
+
+  const funCd = config?.funCooldownMs;
+  if (!Number.isFinite(funCd) || funCd < 0) errors.push('BOT_FUN_COOLDOWN_MS غير صالح.');
+  if (Number.isFinite(funCd) && funCd > 600_000) warnings.push('BOT_FUN_COOLDOWN_MS كبير جدًا.');
+
+  if (Array.isArray(config?.allowlist) && config.allowlist.length === 0) {
+    warnings.push('BOT_ALLOWLIST فارغ: الأوامر المحمية ستُرفض.');
+  }
+
+  if (Number.isFinite(cmdCd) && Number.isFinite(funCd) && funCd > 0 && cmdCd > 0 && funCd < cmdCd) {
+    warnings.push('BOT_FUN_COOLDOWN_MS أقل من BOT_CMD_COOLDOWN_MS.');
+  }
+
+  return { ok: errors.length === 0, errors, warnings };
 }
