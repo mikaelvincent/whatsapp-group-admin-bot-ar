@@ -7,11 +7,12 @@
     "node": ">=20"
   },
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "test": "node --test"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.21",
-    "pino": "^10.3.0",
-    "qrcode-terminal": "^0.12.0"
+    "@whiskeysockets/baileys": "6.7.21",
+    "pino": "10.3.0",
+    "qrcode-terminal": "0.12.0"
   }
 }
