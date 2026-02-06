@@ -34,6 +34,7 @@ export function renderHelp({ prefix, commands }) {
   }
 
   lines.push('');
+  lines.push(`ملاحظة: لإلغاء حظر رقم خارج المجموعة استخدم: ${prefix}unban +9665XXXXXXX (سيتم حذف رسالة الأمر إن أمكن).`);
   lines.push(`اكتب ${prefix}targets لمعرفة طريقة تحديد الهدف.`);
 
   return lines.join('\n');
