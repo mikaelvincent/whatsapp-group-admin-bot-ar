@@ -243,6 +243,64 @@ test('delete messages from muted user', async () => {
   await store.close();
 });
 
+test('delete muted message when bot id is LID', async () => {
+  const { store } = await makeTempStore();
+
+  const groupJid = '123@g.us';
+  const botJid = '999@s.whatsapp.net';
+  const botLid = 'bot@lid';
+  const adminJid = '111@s.whatsapp.net';
+  const targetJid = '222@s.whatsapp.net';
+
+  const config = {
+    prefix: '!',
+    allowlist: [adminJid],
+    requireCallerAdmin: false,
+    moderationWarnCooldownMs: 0,
+    commandCooldownMs: 0,
+    funCooldownMs: 0,
+    pingResponse: 'pong'
+  };
+
+  const groupMeta = {
+    subject: 'Test Group',
+    participants: [
+      { id: botLid, lid: botLid, phoneNumber: botJid, admin: 'admin' },
+      { id: adminJid, admin: 'admin' },
+      { id: targetJid }
+    ]
+  };
+
+  const socket = createSocketStub({ botJid, groupMeta });
+
+  const router = createCommandRouter({ config, logger, store });
+
+  await router.handle({
+    socket,
+    msg: groupMessage({
+      groupJid,
+      senderJid: adminJid,
+      text: '!mute @222',
+      mentionedJids: [targetJid]
+    })
+  });
+
+  assert.equal(store.getMute(groupJid, targetJid).muted, true);
+
+  socket.sent.length = 0;
+
+  await router.handle({
+    socket,
+    msg: groupMessage({ groupJid, senderJid: targetJid, id: 'm-muted-lid', text: 'hello' })
+  });
+
+  assert.equal(socket.sent.length, 2);
+  assert.ok(socket.sent[0].message.delete);
+  assert.ok(String(socket.sent[1].message.text).includes('أنت مكتوم'));
+
+  await store.close();
+});
+
 test('fallback to text menu when interactive fails', async () => {
   const { store } = await makeTempStore();
 
