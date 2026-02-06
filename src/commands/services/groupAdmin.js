@@ -21,9 +21,19 @@ function uniqOrdered(values) {
   return out;
 }
 
+function normalizePnJid(value) {
+  const direct = normalizeUserJid(value);
+  if (direct) return direct;
+
+  const digits = String(value ?? '').replace(/\D/g, '');
+  if (!digits) return null;
+
+  return normalizeUserJid(`${digits}@s.whatsapp.net`);
+}
+
 function getSocketUserJids(socket) {
   const u = socket?.user;
-  return uniqOrdered([normalizeUserJid(u?.phoneNumber), normalizeUserJid(u?.id), normalizeUserJid(u?.lid)]);
+  return uniqOrdered([normalizeUserJid(u?.lid), normalizeUserJid(u?.id), normalizePnJid(u?.phoneNumber)]);
 }
 
 function getLidMapping(socket) {
@@ -82,8 +92,7 @@ function participantAdminFlag(p) {
 }
 
 function extractParticipantJids(p) {
-  const candidates = [p?.id, p?.lid, p?.phoneNumber];
-  return candidates.map(normalizeUserJid).filter(Boolean);
+  return uniqOrdered([normalizeUserJid(p?.id), normalizeUserJid(p?.lid), normalizePnJid(p?.phoneNumber)]);
 }
 
 export function createGroupAdminService({ logger, ttlMs = 30_000 } = {}) {
