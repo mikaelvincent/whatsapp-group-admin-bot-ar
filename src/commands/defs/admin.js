@@ -35,9 +35,7 @@ export function createAdminCommands({ logger, sanitizeTargets, getAdminStatus })
     }
 
     if (!Array.isArray(targets) || targets.length === 0) {
-      await ctx.reply(
-        `لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${example}`
-      );
+      await ctx.reply(`لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${example}`);
       return null;
     }
 
@@ -147,7 +145,15 @@ export function createAdminCommands({ logger, sanitizeTargets, getAdminStatus })
     privileged: true,
     groupOnly: true,
     handler: async (ctx) => {
-      const targets = await resolveTargets(ctx, `${ctx.prefix}unban @شخص`);
+      if (ctx.groupJid && ctx.targetSource === 'number' && ctx.msg?.key) {
+        try {
+          await ctx.socket.sendMessage(ctx.groupJid, { delete: ctx.msg.key });
+        } catch (err) {
+          logger.warn('فشل حذف رسالة أمر unban', { group: ctx.groupJid, err: String(err) });
+        }
+      }
+
+      const targets = await resolveTargets(ctx, `${ctx.prefix}unban +9665XXXXXXX`);
       if (!targets) return;
 
       let result;
