@@ -416,3 +416,45 @@ test('reject kick when bot is not admin', async () => {
 
   await store.close();
 });
+
+test('unban by number replies without quoting', async () => {
+  const { store } = await makeTempStore();
+
+  const groupJid = '123@g.us';
+  const botJid = '999@s.whatsapp.net';
+  const senderJid = '111@s.whatsapp.net';
+
+  const targetJid = '639661851118@s.whatsapp.net';
+
+  const config = {
+    prefix: '!',
+    allowlist: [senderJid],
+    requireCallerAdmin: false,
+    moderationWarnCooldownMs: 0,
+    commandCooldownMs: 0,
+    funCooldownMs: 0,
+    pingResponse: 'pong'
+  };
+
+  await store.addBans(groupJid, [targetJid]);
+
+  const socket = createSocketStub({
+    botJid,
+    groupMeta: makeGroupMeta({ botJid, botAdmin: true, senderJid, senderAdmin: true })
+  });
+
+  const router = createCommandRouter({ config, logger, store });
+
+  await router.handle({
+    socket,
+    msg: groupMessage({ groupJid, senderJid, text: '!unban +639661851118' })
+  });
+
+  assert.ok(socket.sent.some((s) => s.message && s.message.delete));
+
+  const last = socket.sent.at(-1);
+  assert.equal(last.message.text, '✅ تم إلغاء الحظر عن 1 عضو/أعضاء.');
+  assert.equal(last.opts, undefined);
+
+  await store.close();
+});
