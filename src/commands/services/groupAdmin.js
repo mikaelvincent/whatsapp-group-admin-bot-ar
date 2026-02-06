@@ -8,6 +8,24 @@ function isLidUserJid(jid) {
   return typeof jid === 'string' && jid.endsWith('@lid');
 }
 
+function uniqOrdered(values) {
+  const out = [];
+  const seen = new Set();
+
+  for (const v of Array.isArray(values) ? values : []) {
+    if (!v || seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+  }
+
+  return out;
+}
+
+function getSocketUserJids(socket) {
+  const u = socket?.user;
+  return uniqOrdered([normalizeUserJid(u?.phoneNumber), normalizeUserJid(u?.id), normalizeUserJid(u?.lid)]);
+}
+
 function getLidMapping(socket) {
   const mapping = socket?.signalRepository?.lidMapping;
   return mapping && typeof mapping === 'object' ? mapping : null;
@@ -109,13 +127,23 @@ export function createGroupAdminService({ logger, ttlMs = 30_000 } = {}) {
     }
   };
 
-  const getBotJid = (socket) => normalizeUserJid(socket?.user?.id || null);
+  const getBotJid = (socket) => {
+    const ids = getSocketUserJids(socket);
+    return ids[0] || null;
+  };
 
   const sanitizeTargets = async (socket, targets) => {
-    const botJid = getBotJid(socket);
+    const botBase = getSocketUserJids(socket);
+    const botSet = new Set(botBase);
+
+    for (const jid of botBase) {
+      const set = await buildCandidateJids(socket, jid);
+      for (const candidate of set) botSet.add(candidate);
+    }
+
     const unique = Array.from(
       new Set((Array.isArray(targets) ? targets : []).map(normalizeUserJid).filter(Boolean))
-    ).filter((jid) => isUserJid(jid) && (!botJid || jid !== botJid));
+    ).filter((jid) => isUserJid(jid) && !botSet.has(jid));
 
     const resolved = [];
     for (const jid of unique) {
