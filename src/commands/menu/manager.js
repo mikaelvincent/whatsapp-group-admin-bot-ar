@@ -44,12 +44,14 @@ export function createMenuManager({ config, logger, store, allowlist, commandsRe
     lines.push('');
     lines.push(`- ${config.prefix}kick : إخراج عضو/أعضاء`);
     lines.push(`- ${config.prefix}ban : إخراج + حظر دائم`);
-    lines.push(`- ${config.prefix}unban : إلغاء الحظر`);
+    lines.push(`- ${config.prefix}unban <رقم> : إلغاء الحظر (بالرقم)`);
     lines.push(`- ${config.prefix}promote : ترقية لمشرف`);
     lines.push(`- ${config.prefix}demote : تنزيل مشرف`);
     lines.push(`- ${config.prefix}mute [مدة] : كتم (حذف رسائل)`);
     lines.push(`- ${config.prefix}unmute : فك الكتم`);
     lines.push('');
+    lines.push('ملاحظة: إذا كان العضو خارج المجموعة، استخدم رقم الهاتف مع رمز الدولة.');
+    lines.push(`مثال: ${config.prefix}unban +9665XXXXXXX (سيتم حذف رسالة الأمر إن أمكن).`);
     lines.push('ملاحظة: أغلب هذه الأوامر تتطلب أن يكون البوت مشرفًا.');
     lines.push(`أرسل 0 للرجوع للقائمة.`);
 
