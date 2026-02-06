@@ -62,6 +62,37 @@ function messageKeyToId(key) {
   return `${jid}|${id}`;
 }
 
+function uniqOrdered(values) {
+  const out = [];
+  const seen = new Set();
+
+  for (const v of Array.isArray(values) ? values : []) {
+    if (!v || seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+  }
+
+  return out;
+}
+
+function extractParticipantJids(participant) {
+  if (typeof participant === 'string') {
+    const jid = normalizeUserJid(participant);
+    return { primary: jid, all: jid ? [jid] : [] };
+  }
+
+  const p = participant && typeof participant === 'object' ? participant : null;
+  if (!p) return { primary: null, all: [] };
+
+  const all = uniqOrdered([normalizeUserJid(p.id), normalizeUserJid(p.lid), normalizeUserJid(p.phoneNumber)]);
+  return { primary: all[0] || null, all };
+}
+
+function getSocketUserJids(socketRef) {
+  const u = socketRef?.user;
+  return uniqOrdered([normalizeUserJid(u?.id || null), normalizeUserJid(u?.lid || null), normalizeUserJid(u?.phoneNumber || null)]);
+}
+
 export async function startWhatsAppBot({ config, logger }) {
   let socket = null;
   let stopped = false;
@@ -271,27 +302,28 @@ export async function startWhatsAppBot({ config, logger }) {
           const action = String(update?.action ?? '').trim().toLowerCase();
           if (action !== 'add' && action !== 'invite') return;
 
-          const participants = Array.isArray(update?.participants)
-            ? update.participants.map(normalizeUserJid).filter(Boolean)
-            : [];
+          const rawParticipants = Array.isArray(update?.participants) ? update.participants : [];
+          const entries = [];
 
-          if (participants.length === 0) return;
+          for (const p of rawParticipants) {
+            const extracted = extractParticipantJids(p);
+            if (!extracted.primary) continue;
+            entries.push(extracted);
+          }
 
-          const botJid = normalizeUserJid(socket?.user?.id || null);
+          if (entries.length === 0) return;
+
+          const botSet = new Set(getSocketUserJids(socket));
 
           const banned = [];
           const welcomed = [];
 
-          for (const jid of participants) {
-            if (!jid) continue;
-            if (botJid && jid === botJid) continue;
+          for (const entry of entries) {
+            if (entry.all.some((jid) => botSet.has(jid))) continue;
 
-            if (store.isBanned(groupJid, jid)) {
-              banned.push(jid);
-              continue;
-            }
-
-            welcomed.push(jid);
+            const isBanned = entry.all.some((jid) => store.isBanned(groupJid, jid));
+            if (isBanned) banned.push(entry);
+            else welcomed.push(entry);
           }
 
           if (banned.length > 0) {
@@ -299,13 +331,22 @@ export async function startWhatsAppBot({ config, logger }) {
             const failed = [];
 
             for (let i = 0; i < banned.length; i += 1) {
-              const jid = banned[i];
-              try {
-                await socket.groupParticipantsUpdate(groupJid, [jid], 'remove');
-                removed.push(jid);
-              } catch (err) {
-                failed.push({ jid, err: String(err) });
+              const entry = banned[i];
+              let didRemove = false;
+              let lastErr = null;
+
+              for (const jid of entry.all) {
+                try {
+                  await socket.groupParticipantsUpdate(groupJid, [jid], 'remove');
+                  removed.push(jid);
+                  didRemove = true;
+                  break;
+                } catch (err) {
+                  lastErr = err;
+                }
               }
+
+              if (!didRemove) failed.push({ jids: entry.all, err: String(lastErr) });
 
               if (i + 1 < banned.length) await sleep(350);
             }
@@ -348,7 +389,18 @@ export async function startWhatsAppBot({ config, logger }) {
 
           if (welcomed.length === 0) return;
 
-          const tags = welcomed.map(jidMentionTag).filter(Boolean);
+          const mentionSet = new Set();
+          const tags = [];
+
+          for (const entry of welcomed) {
+            const jid = entry.primary;
+            if (!jid || mentionSet.has(jid)) continue;
+            mentionSet.add(jid);
+            const tag = jidMentionTag(jid);
+            if (tag) tags.push(tag);
+          }
+
+          const mentions = Array.from(mentionSet);
           const usersLabel = tags.length > 0 ? tags.join('، ') : 'أهلًا بك!';
 
           const template = String(welcome.template ?? '').trim();
@@ -365,11 +417,11 @@ export async function startWhatsAppBot({ config, logger }) {
             prefix: config.prefix
           });
 
-          await safeSendText(socket, groupJid, text, null, { mentions: welcomed });
+          await safeSendText(socket, groupJid, text, null, { mentions });
 
           logger.info('تم إرسال ترحيب', {
             group: groupJid,
-            users: welcomed.length,
+            users: mentions.length,
             has_rules: Boolean(rules)
           });
         } catch (err) {
