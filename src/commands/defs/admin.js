@@ -1,6 +1,6 @@
 import { formatJids } from '../utils/jid.js';
 import { parseDurationToken, renderDurationAr } from '../utils/parse.js';
-import { sleep } from '../utils/send.js';
+import { safeSendText, sleep } from '../utils/send.js';
 
 async function runGroupAction({ socket, groupJid, action, targets }) {
   const ok = [];
@@ -23,19 +23,21 @@ async function runGroupAction({ socket, groupJid, action, targets }) {
 }
 
 export function createAdminCommands({ logger, sanitizeTargets, getAdminStatus }) {
-  const resolveTargets = async (ctx, example) => {
+  const resolveTargets = async (ctx, example, replyOverride) => {
+    const reply = typeof replyOverride === 'function' ? replyOverride : ctx.reply;
+
     let targets;
 
     try {
       targets = await sanitizeTargets(ctx.socket, ctx.targetJids);
     } catch (err) {
       logger.warn('فشل تجهيز الأهداف', { group: ctx.groupJid, err: String(err) });
-      await ctx.reply('حدث خطأ أثناء تجهيز الأهداف.');
+      await reply('حدث خطأ أثناء تجهيز الأهداف.');
       return null;
     }
 
     if (!Array.isArray(targets) || targets.length === 0) {
-      await ctx.reply(`لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${example}`);
+      await reply(`لم يتم تحديد أي هدف. استخدم الإشارة أو الرد أو رقم هاتف.\nمثال: ${example}`);
       return null;
     }
 
@@ -145,7 +147,14 @@ export function createAdminCommands({ logger, sanitizeTargets, getAdminStatus })
     privileged: true,
     groupOnly: true,
     handler: async (ctx) => {
-      if (ctx.groupJid && ctx.targetSource === 'number' && ctx.msg?.key) {
+      const isNumberTarget = ctx.targetSource === 'number';
+
+      const reply =
+        isNumberTarget && ctx.groupJid
+          ? async (t, extra) => safeSendText(ctx.socket, ctx.groupJid, t, null, extra)
+          : ctx.reply;
+
+      if (ctx.groupJid && isNumberTarget && ctx.msg?.key) {
         try {
           await ctx.socket.sendMessage(ctx.groupJid, { delete: ctx.msg.key });
         } catch (err) {
@@ -153,23 +162,23 @@ export function createAdminCommands({ logger, sanitizeTargets, getAdminStatus })
         }
       }
 
-      const targets = await resolveTargets(ctx, `${ctx.prefix}unban +9665XXXXXXX`);
+      const targets = await resolveTargets(ctx, `${ctx.prefix}unban +9665XXXXXXX`, reply);
       if (!targets) return;
 
       let result;
       try {
         result = await ctx.store.removeBans(ctx.groupJid, targets);
       } catch (err) {
-        await ctx.reply('حدث خطأ أثناء تحديث قائمة الحظر.');
+        await reply('حدث خطأ أثناء تحديث قائمة الحظر.');
         return;
       }
 
       if (result.removed === 0) {
-        await ctx.reply('لا يوجد حظر على الأهداف المحددة.');
+        await reply('لا يوجد حظر على الأهداف المحددة.');
         return;
       }
 
-      await ctx.reply(`✅ تم إلغاء الحظر عن ${result.removed} عضو/أعضاء.`);
+      await reply(`✅ تم إلغاء الحظر عن ${result.removed} عضو/أعضاء.`);
     }
   };
 
