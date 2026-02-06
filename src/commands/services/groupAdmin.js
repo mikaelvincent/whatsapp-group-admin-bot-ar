@@ -4,10 +4,19 @@ function isPnUserJid(jid) {
   return typeof jid === 'string' && jid.endsWith('@s.whatsapp.net');
 }
 
+function isLidUserJid(jid) {
+  return typeof jid === 'string' && jid.endsWith('@lid');
+}
+
+function getLidMapping(socket) {
+  const mapping = socket?.signalRepository?.lidMapping;
+  return mapping && typeof mapping === 'object' ? mapping : null;
+}
+
 async function maybeToLid(socket, userJid) {
   if (!isPnUserJid(userJid)) return userJid;
 
-  const mapping = socket?.signalRepository?.lidMapping;
+  const mapping = getLidMapping(socket);
   if (!mapping || typeof mapping.getLIDForPN !== 'function') return userJid;
 
   try {
@@ -16,6 +25,47 @@ async function maybeToLid(socket, userJid) {
   } catch {
     return userJid;
   }
+}
+
+async function maybeToPn(socket, userJid) {
+  if (!isLidUserJid(userJid)) return userJid;
+
+  const mapping = getLidMapping(socket);
+  if (!mapping || typeof mapping.getPNForLID !== 'function') return userJid;
+
+  try {
+    const pn = await mapping.getPNForLID(userJid);
+    return normalizeUserJid(pn) || userJid;
+  } catch {
+    return userJid;
+  }
+}
+
+async function buildCandidateJids(socket, userJid) {
+  const normalized = normalizeUserJid(userJid);
+  if (!normalized) return new Set();
+
+  const set = new Set([normalized]);
+
+  if (isPnUserJid(normalized)) {
+    const lid = normalizeUserJid(await maybeToLid(socket, normalized));
+    if (lid) set.add(lid);
+  } else if (isLidUserJid(normalized)) {
+    const pn = normalizeUserJid(await maybeToPn(socket, normalized));
+    if (pn) set.add(pn);
+  }
+
+  return set;
+}
+
+function participantAdminFlag(p) {
+  if (!p || typeof p !== 'object') return false;
+  return Boolean(p.admin) || Boolean(p.isAdmin) || Boolean(p.isSuperAdmin);
+}
+
+function extractParticipantJids(p) {
+  const candidates = [p?.id, p?.lid, p?.phoneNumber];
+  return candidates.map(normalizeUserJid).filter(Boolean);
 }
 
 export function createGroupAdminService({ logger, ttlMs = 30_000 } = {}) {
@@ -40,14 +90,16 @@ export function createGroupAdminService({ logger, ttlMs = 30_000 } = {}) {
       const parts = meta?.participants;
       if (!Array.isArray(parts)) return { ok: true, isAdmin: false };
 
-      const normalized = normalizeUserJid(userJid);
-      if (!normalized) return { ok: true, isAdmin: false };
+      const userCandidates = await buildCandidateJids(socket, userJid);
+      if (userCandidates.size === 0) return { ok: true, isAdmin: false };
 
       for (const p of parts) {
-        const pid = normalizeUserJid(p?.id || null);
-        if (!pid) continue;
-        if (pid !== normalized) continue;
-        return { ok: true, isAdmin: Boolean(p?.admin) };
+        const ids = extractParticipantJids(p);
+        for (const id of ids) {
+          if (!id) continue;
+          if (!userCandidates.has(id)) continue;
+          return { ok: true, isAdmin: participantAdminFlag(p) };
+        }
       }
 
       return { ok: true, isAdmin: false };
